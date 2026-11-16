@@ -244,18 +244,15 @@ String _childPath() {
 /// a parameter, not a zone value, so they show in the signature of everything
 /// that passes them on.
 class ExecTaps {
-  const ExecTaps({this.onOutput, this.onPrinted, this.onProcess});
+  const ExecTaps({this.onOutput, this.onProcess});
 
   /// Nobody is listening.
   static const none = ExecTaps();
 
-  /// The run's output a line at a time, AS IT IS PRINTED, so a host can show
-  /// a running `dart test` instead of a spinner.
-  final void Function(String line)? onOutput;
-
-  /// [onOutput], with the pipe each line came from, for a host that passes
-  /// stdout and stderr on apart.
-  final void Function(Pipe pipe, String line)? onPrinted;
+  /// The run's output a line at a time, AS IT IS PRINTED, with the pipe each
+  /// line came out of, so a host can show a running `dart test` instead of a
+  /// spinner, or pass stdout and stderr on apart.
+  final void Function(Pipe pipe, String line)? onOutput;
 
   /// Told when the run starts a process (`ended` false) and when that
   /// process has let go of its stdout and stderr (`ended` true). Pipes
@@ -587,13 +584,9 @@ class Executor {
 
     final out = BytesBuilder(copy: false);
     final err = BytesBuilder(copy: false);
-    final ExecTaps(:onOutput, :onPrinted) = taps;
-    _LineTap? tapOn(Pipe pipe) => onOutput == null && onPrinted == null
-        ? null
-        : _LineTap((line) {
-            onOutput?.call(line);
-            onPrinted?.call(pipe, line);
-          });
+    final onOutput = taps.onOutput;
+    _LineTap? tapOn(Pipe pipe) =>
+        onOutput == null ? null : _LineTap((line) => onOutput(pipe, line));
     final tapOut = tapOn(Pipe.stdout);
     final tapErr = tapOn(Pipe.stderr);
     // One timer, started by the first chunk of output and restarted by each
