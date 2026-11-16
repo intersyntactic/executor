@@ -244,14 +244,10 @@ String _childPath() {
 /// a parameter, not a zone value, so they show in the signature of everything
 /// that passes them on.
 class ExecTaps {
-  const ExecTaps({this.output, this.onProcess});
+  const ExecTaps({this.onProcess});
 
   /// Nobody is listening.
   static const none = ExecTaps();
-
-  /// Where the run's output goes AS IT IS PRINTED: exactly, in [Chunks], or a
-  /// line at a time, in [Lines].
-  final OutputTap? output;
 
   /// Told when the run starts a process (`ended` false) and when that
   /// process has let go of its stdout and stderr (`ended` true). Pipes
@@ -311,128 +307,27 @@ Future<bool> groupAlive(int leader) async {
   }
 }
 
-/// The pipe a piece of a command's output came out of.
-enum Pipe { stdout, stderr }
+/// A command [Executor.start] was asked to run, while it runs: what it
+/// prints, as it prints it, and what became of it.
+///
+/// [stdout] and [stderr] are single-subscription streams: until one is
+/// listened to, it holds what arrives. That is no more than the [result]
+/// holds anyway, and is let go with this object, so a caller that wants only
+/// the result may leave them; [Executor.run] makes none.
+final class Running {
+  Running._(this.stdout, this.stderr, this.result);
 
-/// How a run passes its output on as it is printed ([ExecTaps.output]):
-/// exactly, in [Chunks], or a line at a time, in [Lines].
-sealed class OutputTap {
-  const OutputTap();
-}
+  /// What the command prints on stdout, decoded as it arrives, so a
+  /// character cut across two chunks comes through whole. Put together it is
+  /// [ExecResult.stdout]. Done when the run stops capturing. For lines:
+  /// `stdout.transform(const LineSplitter())`.
+  final Stream<String> stdout;
 
-/// The output in the pieces it arrives in, with the pipe each came out of:
-/// put together, a pipe's pieces are exactly what the command printed on
-/// it, decoded.
-final class Chunks extends OutputTap {
-  const Chunks(this.onText);
+  /// As [stdout], for stderr.
+  final Stream<String> stderr;
 
-  final void Function(Pipe pipe, String text) onText;
-}
-
-/// The output a line at a time, so a host can show a running `dart test`
-/// instead of a spinner. A line ends at `\r` as well as `\n`: progress output
-/// redraws its line with `\r`, and each redraw is the newest thing to show.
-/// A line of only whitespace is not passed on, and a last line with no
-/// newline is passed on when the run ends.
-final class Lines extends OutputTap {
-  const Lines(this.onLine);
-
-  final void Function(Pipe pipe, String line) onLine;
-}
-
-/// One run's output, passed on as its [OutputTap] asks. Made by the run and
-/// finished by it, so no caller holds a line half-read.
-final class _RunOutput {
-  _RunOutput(this._tap);
-
-  final OutputTap _tap;
-  late final _decoders = {
-    for (final pipe in Pipe.values)
-      pipe: _Decoder((text) => _passOn(pipe, text)),
-  };
-  final _unfinished = {for (final pipe in Pipe.values) pipe: StringBuffer()};
-  var _finished = false;
-
-  void add(Pipe pipe, List<int> bytes) {
-    if (!_finished) _decoders[pipe]!.add(bytes);
-  }
-
-  /// Decodes what each pipe still holds (a character cut off at the end
-  /// becomes U+FFFD) and, for [Lines], passes on each last line. Once only;
-  /// the run calls it when the pipes close and again when it stops waiting
-  /// for them.
-  void finish() {
-    if (_finished) return;
-    _finished = true;
-    for (final decoder in _decoders.values) {
-      decoder.close();
-    }
-    if (_tap is Lines) _unfinished.keys.forEach(_endLine);
-  }
-
-  void _passOn(Pipe pipe, String text) {
-    switch (_tap) {
-      case Chunks(:final onText):
-        _safely(() => onText(pipe, text));
-      case Lines():
-        final line = _unfinished[pipe]!;
-        for (final unit in text.codeUnits) {
-          if (unit == 10 || unit == 13) {
-            _endLine(pipe);
-          } else {
-            line.writeCharCode(unit);
-          }
-        }
-    }
-  }
-
-  void _endLine(Pipe pipe) {
-    final buffer = _unfinished[pipe]!;
-    final line = buffer.toString();
-    buffer.clear();
-    if (_tap case Lines(:final onLine) when line.trim().isNotEmpty) {
-      _safely(() => onLine(pipe, line));
-    }
-  }
-
-  static void _safely(void Function() call) {
-    try {
-      call();
-      // ignore: avoid_catches_without_on_clauses, the caller's code, not ours
-    } catch (_) {
-      // A display callback failing must not fail the command.
-    }
-  }
-}
-
-/// Decodes one pipe's bytes as they arrive. A chunk can end partway through
-/// a character, so the decoder holds those bytes until the rest comes,
-/// rather than decoding each chunk on its own and garbling what was cut.
-final class _Decoder {
-  _Decoder(void Function(String text) text)
-    : _bytes = const Utf8Decoder(allowMalformed: true)
-          .startChunkedConversion(_Text(text));
-
-  final ByteConversionSink _bytes;
-
-  void add(List<int> bytes) => _bytes.add(bytes);
-
-  void close() => _bytes.close();
-}
-
-/// Where a [_Decoder] puts what it has decoded.
-final class _Text implements Sink<String> {
-  _Text(this._text);
-
-  final void Function(String text) _text;
-
-  @override
-  void add(String text) {
-    if (text.isNotEmpty) _text(text);
-  }
-
-  @override
-  void close() {}
+  /// Whether it started, and if so what it did.
+  final Future<ExecStart> result;
 }
 
 /// Runs commands, having asked first.
@@ -510,8 +405,9 @@ class Executor {
   /// not counted -- a slow start (`flutter test` resolving packages, waiting on
   /// flutter's startup lock) is not a hang -- and [timeout] still bounds it.
   ///
-  /// [taps] are where the run's output lines and processes are reported (see
-  /// [ExecTaps]). A caller passes on the ones it was given. REQUIRED, so a
+  /// [taps] are where the run's processes are reported (see [ExecTaps]); its
+  /// output, as it is printed, is [start]'s. A caller passes on the taps it
+  /// was given. REQUIRED, so a
   /// caller cannot forget to pass them on: one that really has nobody to
   /// report to says so with [ExecTaps.none].
   ///
@@ -532,6 +428,7 @@ class Executor {
       quiet: quiet,
       taps: taps,
       input: null,
+      printed: null,
     ),
   );
 
@@ -556,29 +453,48 @@ class Executor {
       quiet: quiet,
       taps: taps,
       input: input,
+      printed: null,
     ),
   );
 
-  /// [run], with a command that was never started told apart from one that
-  /// was: [ExecNotStarted], with why, rather than an exit code no program gave.
+  /// [run], with what the command prints as it prints it ([Running.stdout],
+  /// [Running.stderr]), and a command that was never started told apart from
+  /// one that was: [ExecNotStarted], with why, rather than an exit code no
+  /// program gave. A command not started prints nothing, and its streams
+  /// close at once.
   ///
   /// [input], when given, is sent to the command's stdin as UTF-8 and then
   /// closed, as [runWithInput] sends it; when null, stdin is closed at once.
   /// For the program driver, whose runs the airlock has decided, input
   /// included. A tool is given a runner without this method.
-  Future<ExecStart> start(
+  Running start(
     List<String> argv, {
     String? input,
     String? workingSubdir,
     Duration? quiet,
     required ExecTaps taps,
-  }) => _start(
-    argv,
-    workingSubdir: workingSubdir,
-    quiet: quiet,
-    taps: taps,
-    input: input,
-  );
+  }) {
+    final out = StreamController<List<int>>();
+    final err = StreamController<List<int>>();
+    final result =
+        _start(
+          argv,
+          workingSubdir: workingSubdir,
+          quiet: quiet,
+          taps: taps,
+          input: input,
+          printed: (out: out, err: err),
+        ).whenComplete(() {
+          unawaited(out.close());
+          unawaited(err.close());
+        });
+    const decoder = Utf8Decoder(allowMalformed: true);
+    return Running._(
+      out.stream.transform(decoder),
+      err.stream.transform(decoder),
+      result,
+    );
+  }
 
   /// [start] as [run] reports it: a command not started as exit -1, marked
   /// [ExecResult.refused] where the run was refused rather than impossible,
@@ -610,6 +526,11 @@ class Executor {
     required Duration? quiet,
     required ExecTaps taps,
     required String? input,
+    required ({
+      StreamController<List<int>> out,
+      StreamController<List<int>> err,
+    })?
+    printed,
   }) async {
     if (argv.isEmpty || argv.first.trim().isEmpty) return const _NoCommand();
 
@@ -672,10 +593,6 @@ class Executor {
 
     final out = BytesBuilder(copy: false);
     final err = BytesBuilder(copy: false);
-    final output = switch (taps.output) {
-      final tap? => _RunOutput(tap),
-      null => null,
-    };
     // One timer, started by the first chunk of output and restarted by each
     // one after: it fires only after [quiet] with nothing printed mid-run.
     final silence = Completer<void>();
@@ -700,15 +617,15 @@ class Executor {
         if (!capturing) return;
         heard();
         out.add(c);
-        output?.add(Pipe.stdout, c);
+        printed?.out.add(c);
       }),
       proc.stderr.forEach((b) {
         if (!capturing) return;
         heard();
         err.add(b);
-        output?.add(Pipe.stderr, b);
+        printed?.err.add(b);
       }),
-    ]).whenComplete(() => output?.finish());
+    ]);
     // Both pipes closed: nothing the command started still holds them. This
     // can come long after the result was returned (a leaked grandchild).
     unawaited(
@@ -787,7 +704,6 @@ class Executor {
     // dies, so the drain is bounded too. Whatever was captured is reported.
     await _within(ExecTimer.drain, drainWait, drained);
     capturing = false;
-    output?.finish();
 
     // Decoded leniently: output that is not UTF-8 (`cat` or `git` on a binary)
     // is still output, not an error.
