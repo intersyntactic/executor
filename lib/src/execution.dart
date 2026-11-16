@@ -244,7 +244,7 @@ String _childPath() {
 /// a parameter, not a zone value, so they show in the signature of everything
 /// that passes them on.
 class ExecTaps {
-  const ExecTaps({this.onOutput, this.onProcess});
+  const ExecTaps({this.onOutput, this.onPrinted, this.onProcess});
 
   /// Nobody is listening.
   static const none = ExecTaps();
@@ -252,6 +252,10 @@ class ExecTaps {
   /// The run's output a line at a time, AS IT IS PRINTED, so a host can show
   /// a running `dart test` instead of a spinner.
   final void Function(String line)? onOutput;
+
+  /// [onOutput], with the pipe each line came from, for a host that passes
+  /// stdout and stderr on apart.
+  final void Function(Pipe pipe, String line)? onPrinted;
 
   /// Told when the run starts a process (`ended` false) and when that
   /// process has let go of its stdout and stderr (`ended` true). Pipes
@@ -310,6 +314,9 @@ Future<bool> groupAlive(int leader) async {
     return true;
   }
 }
+
+/// The pipe a line of a command's output came out of.
+enum Pipe { stdout, stderr }
 
 /// Splits a byte stream into lines for [ExecTaps.onOutput]. On `\r`
 /// as well as `\n`: progress output redraws its line with `\r`, and each
@@ -580,9 +587,15 @@ class Executor {
 
     final out = BytesBuilder(copy: false);
     final err = BytesBuilder(copy: false);
-    final onLine = taps.onOutput;
-    final tapOut = onLine == null ? null : _LineTap(onLine);
-    final tapErr = onLine == null ? null : _LineTap(onLine);
+    final ExecTaps(:onOutput, :onPrinted) = taps;
+    _LineTap? tapOn(Pipe pipe) => onOutput == null && onPrinted == null
+        ? null
+        : _LineTap((line) {
+            onOutput?.call(line);
+            onPrinted?.call(pipe, line);
+          });
+    final tapOut = tapOn(Pipe.stdout);
+    final tapErr = tapOn(Pipe.stderr);
     // One timer, started by the first chunk of output and restarted by each
     // one after: it fires only after [quiet] with nothing printed mid-run.
     final silence = Completer<void>();
