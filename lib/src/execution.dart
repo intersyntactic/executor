@@ -27,7 +27,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data' show BytesBuilder;
 
-import 'tree.dart';
+import 'package:is_path_confinement/is_path_confinement.dart';
 
 /// The decision this library refuses to make for you.
 ///
