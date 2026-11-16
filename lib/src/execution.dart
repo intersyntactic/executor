@@ -249,10 +249,11 @@ class ExecTaps {
   /// Nobody is listening.
   static const none = ExecTaps();
 
-  /// The run's output a line at a time, AS IT IS PRINTED, with the pipe each
-  /// line came out of, so a host can show a running `dart test` instead of a
-  /// spinner, or pass stdout and stderr on apart.
-  final void Function(Pipe pipe, String line)? onOutput;
+  /// The run's output AS IT IS PRINTED, in the pieces it arrives in, with the
+  /// pipe each came out of: put together, a pipe's pieces are exactly what
+  /// the command printed on it, decoded. A host showing a running
+  /// `dart test` line by line wraps its callback in [OutputLines].
+  final void Function(Pipe pipe, String text)? onOutput;
 
   /// Told when the run starts a process (`ended` false) and when that
   /// process has let go of its stdout and stderr (`ended` true). Pipes
@@ -315,35 +316,77 @@ Future<bool> groupAlive(int leader) async {
 /// The pipe a line of a command's output came out of.
 enum Pipe { stdout, stderr }
 
-/// Splits a byte stream into lines for [ExecTaps.onOutput]. On `\r`
-/// as well as `\n`: progress output redraws its line with `\r`, and each
-/// redraw is the newest thing to show.
-class _LineTap {
-  final void Function(String) emit;
-  final _pending = <int>[];
-  _LineTap(this.emit);
+/// Decodes one pipe's bytes for [ExecTaps.onOutput] as they arrive. A chunk
+/// can end partway through a character, so the decoder holds those bytes
+/// until the rest comes, rather than decoding each chunk on its own and
+/// garbling what was cut.
+class _ChunkTap implements Sink<String> {
+  _ChunkTap(this.emit);
 
-  void add(List<int> chunk) {
-    for (final b in chunk) {
-      if (b == 10 || b == 13) {
-        flush();
-      } else {
-        _pending.add(b);
-      }
-    }
+  final void Function(String text) emit;
+  late final ByteConversionSink _bytes = const Utf8Decoder(allowMalformed: true)
+      .startChunkedConversion(this);
+
+  var _flushed = false;
+
+  void addBytes(List<int> chunk) {
+    if (!_flushed) _bytes.add(chunk);
   }
 
+  /// Decodes what is held: a character cut off at the end becomes U+FFFD.
+  /// Once only; the run calls it when the pipes close and again when it
+  /// stops waiting for them.
   void flush() {
-    if (_pending.isEmpty) return;
-    final line = utf8.decode(_pending, allowMalformed: true);
-    _pending.clear();
-    if (line.trim().isEmpty) return;
+    if (_flushed) return;
+    _flushed = true;
+    _bytes.close();
+  }
+
+  @override
+  void add(String text) {
+    if (text.isEmpty) return;
     try {
-      emit(line);
+      emit(text);
       // ignore: avoid_catches_without_on_clauses, the caller's code, not ours
     } catch (_) {
       // A display callback failing must not fail the command.
     }
+  }
+
+  @override
+  void close() {}
+}
+
+/// Splits a run's output into lines for a display, from what
+/// [ExecTaps.onOutput] passes on: `ExecTaps(onOutput: lines.call)`, then
+/// [close] once the run is over, for a last line with no newline.
+///
+/// On `\r` as well as `\n`: progress output redraws its line with `\r`, and
+/// each redraw is the newest thing to show. A line of only whitespace is not
+/// passed on. One per run, since it holds each pipe's unfinished line.
+final class OutputLines {
+  OutputLines(this.onLine);
+
+  final void Function(Pipe pipe, String line) onLine;
+  final _pending = {Pipe.stdout: StringBuffer(), Pipe.stderr: StringBuffer()};
+
+  void call(Pipe pipe, String text) {
+    final pending = _pending[pipe]!;
+    for (final unit in text.codeUnits) {
+      if (unit == 10 || unit == 13) {
+        _flush(pipe, pending);
+      } else {
+        pending.writeCharCode(unit);
+      }
+    }
+  }
+
+  void close() => _pending.forEach(_flush);
+
+  void _flush(Pipe pipe, StringBuffer pending) {
+    final line = pending.toString();
+    pending.clear();
+    if (line.trim().isNotEmpty) onLine(pipe, line);
   }
 }
 
@@ -585,8 +628,8 @@ class Executor {
     final out = BytesBuilder(copy: false);
     final err = BytesBuilder(copy: false);
     final onOutput = taps.onOutput;
-    _LineTap? tapOn(Pipe pipe) =>
-        onOutput == null ? null : _LineTap((line) => onOutput(pipe, line));
+    _ChunkTap? tapOn(Pipe pipe) =>
+        onOutput == null ? null : _ChunkTap((text) => onOutput(pipe, text));
     final tapOut = tapOn(Pipe.stdout);
     final tapErr = tapOn(Pipe.stderr);
     // One timer, started by the first chunk of output and restarted by each
@@ -614,13 +657,13 @@ class Executor {
             if (!capturing) return;
             heard();
             out.add(c);
-            tapOut?.add(c);
+            tapOut?.addBytes(c);
           }),
           proc.stderr.forEach((b) {
             if (!capturing) return;
             heard();
             err.add(b);
-            tapErr?.add(b);
+            tapErr?.addBytes(b);
           }),
         ]).whenComplete(() {
           tapOut?.flush();
