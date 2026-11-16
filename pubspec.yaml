@@ -4,7 +4,6 @@ description: >-
   of its own so a timeout kills everything it started.
 version: 0.1.0
 repository: https://github.com/intersyntactic/executor
-publish_to: none
 
 environment:
   sdk: ^3.13.0

@@ -111,10 +111,12 @@ class ExecResult {
       (true, null) => 'timed out and was killed; no exit code',
       (false, null) => 'exit $exitCode',
     });
-    if (stdout.trim().isNotEmpty)
+    if (stdout.trim().isNotEmpty) {
       b.write('\n--- stdout ---\n${stdout.trimRight()}');
-    if (stderr.trim().isNotEmpty)
+    }
+    if (stderr.trim().isNotEmpty) {
       b.write('\n--- stderr ---\n${stderr.trimRight()}');
+    }
     if (stdout.trim().isEmpty && stderr.trim().isEmpty) b.write(' (no output)');
     return b.toString();
   }
