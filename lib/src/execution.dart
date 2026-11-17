@@ -230,6 +230,7 @@ final class _CouldNotStart extends ExecNotStarted {
 /// every call.
 String _childPath() {
   final exe = File(Platform.resolvedExecutable);
+  // wire-ok: the executable's file name as the OS reports it
   final viaDart = exe.uri.pathSegments.last == 'dart';
   return [
     if (viaDart) exe.parent.path,
@@ -270,8 +271,7 @@ void _tellProcess(ProcessTap? tap, int pid, List<String> argv, bool ended) {
   if (tap == null) return;
   try {
     tap(pid, argv, ended);
-    // ignore: avoid_catches_without_on_clauses, the caller's code, not ours
-  } catch (_) {
+  } on Object catch (_) {
     // A display callback failing must not fail the command.
   }
 }
