@@ -85,6 +85,8 @@ class ExecResult {
   /// Why the executor killed the command, which then has no exit code of its
   /// own ([exitCode] is -1); null when it ended by itself. A command that died
   /// of a signal nobody here sent ended by itself, with its own exit code.
+  /// The one exception is [KilledForOutput] for output past the limit once
+  /// the command had exited: what it left was killed, and its code stands.
   final WhyKilled? whyKilled;
 
   const ExecResult({
@@ -102,7 +104,10 @@ class ExecResult {
   /// (`run`'s `quiet`); null otherwise.
   Duration? get silentFor => switch (whyKilled) {
     KilledForSilence(:final quiet) => quiet,
-    KilledForTimeout() || KilledOnRequest() || null => null,
+    KilledForTimeout() ||
+    KilledOnRequest() ||
+    KilledForOutput() ||
+    null => null,
   };
 
   /// Killed because whoever started it called [Running.kill].
@@ -122,6 +127,10 @@ class ExecResult {
         'printed nothing for ${quiet.inSeconds}s and was killed; no exit code',
       KilledForTimeout() => 'timed out and was killed; no exit code',
       KilledOnRequest() => 'was stopped and killed; no exit code',
+      KilledForOutput(:final channel, :final limit) =>
+        'printed more than $limit bytes on ${channel.name}, so the rest was '
+            'cut and it was killed; '
+            '${exitCode == -1 ? 'no exit code' : 'exit $exitCode'}',
       null => 'exit $exitCode',
     });
     if (stdout.trim().isNotEmpty) {
@@ -157,6 +166,21 @@ final class KilledForSilence extends WhyKilled {
 final class KilledOnRequest extends WhyKilled {
   const KilledOnRequest();
 }
+
+/// It printed more than [limit] bytes on [channel] (`start`'s
+/// `maxOutputBytes`). What it printed is kept up to [limit] bytes on each
+/// channel, cut where a character ends, and nothing after the first channel
+/// went over. When it had already exited and what it left running went
+/// over, that was killed, and its exit code stands.
+final class KilledForOutput extends WhyKilled {
+  const KilledForOutput(this.channel, this.limit);
+
+  final OutputChannel channel;
+  final int limit;
+}
+
+/// One of the two channels a command prints on.
+enum OutputChannel { stdout, stderr }
 
 /// What became of a command [Executor.start] was asked to run: it
 /// [ExecStarted], or it was [ExecNotStarted] and why. The two are apart, so a
@@ -529,13 +553,23 @@ class Executor {
   /// closed, as [runWithInput] sends it; when null, stdin is closed at once.
   /// For the program driver, whose runs the airlock has decided, input
   /// included. A tool is given a runner without this method.
+  ///
+  /// [maxOutputBytes], when given, is how much the command may print on
+  /// stdout, and as much again on stderr. The first time it prints past that
+  /// on either, it is killed with its group ([KilledForOutput]), and what it
+  /// printed is kept, and streamed, up to that many bytes on each, cut where
+  /// a character ends. It must not be negative.
   Running start(
     List<String> argv, {
     String? input,
     String? workingSubdir,
     Duration? quiet,
+    int? maxOutputBytes,
     required ExecTaps taps,
   }) {
+    if (maxOutputBytes != null) {
+      RangeError.checkNotNegative(maxOutputBytes, 'maxOutputBytes');
+    }
     final out = StreamController<List<int>>();
     final err = StreamController<List<int>>();
     final killAsked = Completer<void>();
@@ -548,6 +582,7 @@ class Executor {
           input: input,
           printed: (out: out, err: err),
           killAsked: killAsked,
+          maxOutputBytes: maxOutputBytes,
         ).whenComplete(() {
           unawaited(out.close());
           unawaited(err.close());
@@ -601,6 +636,7 @@ class Executor {
     printed,
     // [Running.kill]'s; null for [run], whose caller has no way to kill.
     Completer<void>? killAsked,
+    int? maxOutputBytes,
   }) async {
     if (argv.isEmpty || argv.first.trim().isEmpty) return const _NoCommand();
 
@@ -665,8 +701,12 @@ class Executor {
     unawaited(_feedStdin(proc, input));
     _tellProcess(processTap, proc.pid, argv, false);
 
-    final out = BytesBuilder(copy: false);
-    final err = BytesBuilder(copy: false);
+    final out = _Capture(maxOutputBytes, printed?.out);
+    final err = _Capture(maxOutputBytes, printed?.err);
+    // The first channel to go past [maxOutputBytes]. From then on nothing
+    // more is captured, on either channel, and the run is killed.
+    KilledForOutput? overflowed;
+    final overflow = Completer<KilledForOutput>();
     // One timer, started by the first chunk of output and restarted by each
     // one after: it fires only after [quiet] with nothing printed mid-run.
     final silence = Completer<Duration>();
@@ -686,19 +726,26 @@ class Executor {
       });
     }
 
+    Future<void> capture(
+      Stream<List<int>> pipe,
+      _Capture into,
+      OutputChannel channel,
+    ) async {
+      await pipe.forEach((chunk) {
+        if (!capturing || overflowed != null) return;
+        heard();
+        if (into.add(chunk) case final limit?) {
+          final cut = KilledForOutput(channel, limit);
+          overflowed = cut;
+          overflow.complete(cut);
+        }
+      });
+      if (capturing && overflowed == null) into.close();
+    }
+
     final drained = Future.wait([
-      proc.stdout.forEach((c) {
-        if (!capturing) return;
-        heard();
-        out.add(c);
-        printed?.out.add(c);
-      }),
-      proc.stderr.forEach((b) {
-        if (!capturing) return;
-        heard();
-        err.add(b);
-        printed?.err.add(b);
-      }),
+      capture(proc.stdout, out, OutputChannel.stdout),
+      capture(proc.stderr, err, OutputChannel.stderr),
     ]);
     // Both pipes closed: nothing the command started still holds them. This
     // can come long after the result was returned (a leaked grandchild).
@@ -752,6 +799,7 @@ class Executor {
       silence.future.then(_WentSilent.new),
       overdue.future.then((_) => const _Overdue()),
       if (killAsked != null) killAsked.future.then((_) => const _KillAsked()),
+      overflow.future.then(_Overflowed.new),
     ])) {
       case _Exited(:final exitCode):
         code = exitCode;
@@ -761,6 +809,8 @@ class Executor {
         whyKilled = const KilledForTimeout();
       case _KillAsked():
         whyKilled = const KilledOnRequest();
+      case _Overflowed(:final cut):
+        whyKilled = cut;
     }
     deadline.cancel();
     decided = true;
@@ -781,30 +831,31 @@ class Executor {
     Future<void>? killing;
     if (whyKilled != null) {
       await (killing = killGroup());
-    } else if (killAsked != null) {
+    } else {
       // It ended by itself, and a grandchild may still hold its pipes: a
-      // kill asked for while they drain reaches what it left in its group.
-      unawaited(
-        killAsked.future.then((_) {
-          if (capturing) killing ??= killGroup();
-        }),
-      );
+      // kill asked for while they drain, or output past the limit, reaches
+      // what it left in its group.
+      void killLeftovers(Object? _) {
+        if (capturing) killing ??= killGroup();
+      }
+
+      unawaited(killAsked?.future.then(killLeftovers));
+      unawaited(overflow.future.then(killLeftovers));
     }
     // A grandchild can inherit the pipes and hold them open after its parent
     // dies, so the drain is bounded too. Whatever was captured is reported.
     await _within(ExecTimer.drain, drainWait, drained);
     capturing = false;
     await killing;
+    // Output cut once the command had exited is said too, beside its own
+    // exit code.
+    whyKilled ??= overflowed;
 
-    // Decoded leniently: output that is not UTF-8 (`cat` or `git` on a binary)
-    // is still output, not an error.
-    String text(BytesBuilder b) =>
-        utf8.decode(b.takeBytes(), allowMalformed: true);
     return ExecStarted(
       ExecResult(
-        exitCode: whyKilled == null ? (code ?? -1) : -1,
-        stdout: text(out),
-        stderr: text(err),
+        exitCode: code ?? -1,
+        stdout: out.text,
+        stderr: err.text,
         whyKilled: whyKilled,
       ),
     );
@@ -882,6 +933,91 @@ final class _Overdue extends _Ending {
 
 final class _KillAsked extends _Ending {
   const _KillAsked();
+}
+
+final class _Overflowed extends _Ending {
+  const _Overflowed(this.cut);
+  final KilledForOutput cut;
+}
+
+/// What one of a command's output channels has printed, kept, and passed on
+/// as it arrives, up to [limit] bytes when there is one.
+final class _Capture {
+  _Capture(this.limit, this.passOn);
+
+  final int? limit;
+  final StreamController<List<int>>? passOn;
+  final _kept = BytesBuilder(copy: false);
+
+  // With a limit, a chunk's last bytes that may be a character cut in two
+  // wait for the next chunk, so the cut at the limit falls where a character
+  // ends. At most three bytes, and only until the next chunk or the end.
+  List<int> _held = const [];
+
+  /// Keeps [chunk], and is null; or, when it goes past the limit, keeps
+  /// what fits, cut where a character ends, and is the limit.
+  int? add(List<int> chunk) {
+    final limit = this.limit;
+    if (limit == null) {
+      _keep(chunk);
+      return null;
+    }
+    final bytes = [..._held, ...chunk];
+    final room = limit - _kept.length;
+    if (bytes.length <= room) {
+      final whole = _wholeCharacters(bytes);
+      _keep(bytes.sublist(0, whole));
+      _held = bytes.sublist(whole);
+      return null;
+    }
+    var end = room;
+    while (end > 0 && _continues(bytes[end])) {
+      end--;
+    }
+    _keep(bytes.sublist(0, end));
+    _held = const [];
+    return limit;
+  }
+
+  /// The channel has closed: what was held waiting for the rest of a
+  /// character is all there is.
+  void close() {
+    _keep(_held);
+    _held = const [];
+  }
+
+  /// Decoded leniently: output that is not UTF-8 (`cat` or `git` on a
+  /// binary) is still output, not an error.
+  String get text => utf8.decode(_kept.takeBytes(), allowMalformed: true);
+
+  void _keep(List<int> bytes) {
+    if (bytes.isEmpty) return;
+    _kept.add(bytes);
+    passOn?.add(bytes);
+  }
+
+  static bool _continues(int byte) => byte & 0xC0 == 0x80;
+
+  /// How much of [bytes] ends where a character does: all of it, unless it
+  /// ends in the first bytes of a character whose rest has not come yet.
+  static int _wholeCharacters(List<int> bytes) {
+    var start = bytes.length - 1;
+    while (start >= 0 &&
+        start >= bytes.length - 3 &&
+        _continues(bytes[start])) {
+      start--;
+    }
+    if (start < 0) return bytes.length;
+    final lead = bytes[start];
+    final length = lead >= 0xF0
+        ? 4
+        : lead >= 0xE0
+        ? 3
+        : lead >= 0xC0
+        ? 2
+        : 1;
+    return start + length > bytes.length ? start : bytes.length;
+  }
 }
 
 /// [dir] as a shell's PWD would name it: absolute, with `.` and `..` folded

@@ -1,3 +1,16 @@
+## 0.3.0
+
+- `start` takes `maxOutputBytes`: how much a command may print on stdout,
+  and as much again on stderr. The first time it prints past that on
+  either, it is killed with its group by the same sequence as `kill()`,
+  and the result's `whyKilled` is a `KilledForOutput` naming the channel
+  and the limit. What it printed is kept, and streamed, up to the limit on
+  each channel, cut where a UTF-8 character ends, even when the character
+  arrived split across two writes. Past the limit after the command had
+  exited, what it left running is killed and its exit code stands.
+- Breaking: `WhyKilled` has a new case, `KilledForOutput`, so an
+  exhaustive switch on it needs an arm for it. `OutputChannel` is new.
+
 ## 0.2.0
 
 - `Running.kill()` kills a started command and everything in its process
