@@ -81,20 +81,32 @@ class ExecResult {
   /// The command was not started because it was refused, and [stderr] says
   /// why.
   final bool refused;
-  final bool timedOut;
 
-  /// Set when the command was killed for printing nothing for this long
-  /// (`run`'s `quiet`); null otherwise.
-  final Duration? silentFor;
+  /// Why the executor killed the command, which then has no exit code of its
+  /// own ([exitCode] is -1); null when it ended by itself. A command that died
+  /// of a signal nobody here sent ended by itself, with its own exit code.
+  final WhyKilled? whyKilled;
 
   const ExecResult({
     required this.exitCode,
     required this.stdout,
     required this.stderr,
     this.refused = false,
-    this.timedOut = false,
-    this.silentFor,
+    this.whyKilled,
   });
+
+  /// Killed for running past [Executor.timeout].
+  bool get timedOut => whyKilled is KilledForTimeout;
+
+  /// Set when the command was killed for printing nothing for this long
+  /// (`run`'s `quiet`); null otherwise.
+  Duration? get silentFor => switch (whyKilled) {
+    KilledForSilence(:final quiet) => quiet,
+    KilledForTimeout() || KilledOnRequest() || null => null,
+  };
+
+  /// Killed because whoever started it called [Running.kill].
+  bool get killedOnRequest => whyKilled is KilledOnRequest;
 
   /// What the model is told.
   ///
@@ -105,11 +117,12 @@ class ExecResult {
   /// exit 0 is not a measurement.
   String get forModel {
     if (refused) return 'refused: $stderr';
-    final b = StringBuffer(switch ((timedOut, silentFor)) {
-      (_, final quiet?) =>
+    final b = StringBuffer(switch (whyKilled) {
+      KilledForSilence(:final quiet) =>
         'printed nothing for ${quiet.inSeconds}s and was killed; no exit code',
-      (true, null) => 'timed out and was killed; no exit code',
-      (false, null) => 'exit $exitCode',
+      KilledForTimeout() => 'timed out and was killed; no exit code',
+      KilledOnRequest() => 'was stopped and killed; no exit code',
+      null => 'exit $exitCode',
     });
     if (stdout.trim().isNotEmpty) {
       b.write('\n--- stdout ---\n${stdout.trimRight()}');
@@ -120,6 +133,29 @@ class ExecResult {
     if (stdout.trim().isEmpty && stderr.trim().isEmpty) b.write(' (no output)');
     return b.toString();
   }
+}
+
+/// Why an [Executor] killed a command it started, and with it everything in
+/// the command's process group.
+sealed class WhyKilled {
+  const WhyKilled();
+}
+
+/// It ran past [Executor.timeout].
+final class KilledForTimeout extends WhyKilled {
+  const KilledForTimeout();
+}
+
+/// Having started printing, it printed nothing for [quiet] (`run`'s `quiet`).
+final class KilledForSilence extends WhyKilled {
+  const KilledForSilence(this.quiet);
+
+  final Duration quiet;
+}
+
+/// Whoever started it called [Running.kill].
+final class KilledOnRequest extends WhyKilled {
+  const KilledOnRequest();
 }
 
 /// What became of a command [Executor.start] was asked to run: it
@@ -209,6 +245,14 @@ final class _NotApproved extends ExecNotStarted {
 
   @override
   String get why => 'this command was not approved';
+}
+
+/// [Running.kill] was called before the command was started, so it was not.
+final class _KilledBeforeStart extends ExecNotStarted {
+  const _KilledBeforeStart();
+
+  @override
+  String get why => 'killed before it started';
 }
 
 /// The operating system would not start it, for [message].
@@ -317,7 +361,9 @@ Future<bool> groupAlive(int leader) async {
 /// holds anyway, and is let go with this object, so a caller that wants only
 /// the result may leave them; [Executor.run] makes none.
 final class Running {
-  Running._(this.stdout, this.stderr, this.result);
+  Running._(this.stdout, this.stderr, this.result, this._killAsked);
+
+  final Completer<void> _killAsked;
 
   /// What the command prints on stdout, decoded as it arrives, so a
   /// character cut across two chunks comes through whole. Put together it is
@@ -330,6 +376,20 @@ final class Running {
 
   /// Whether it started, and if so what it did.
   final Future<ExecStart> result;
+
+  /// Kills the command and everything in its process group, as a timeout
+  /// does, and completes once [result] has.
+  ///
+  /// Before the command is started it is not started: [result] is an
+  /// [ExecNotStarted]. While it runs it is killed, and its result says
+  /// [KilledOnRequest]. Once it has ended by itself, while its pipes are
+  /// still being drained, what it left running in its group is killed and
+  /// its result keeps its own exit code; after [result] has completed,
+  /// nothing is done. Calling it again does no more than the first call.
+  Future<void> kill() {
+    if (!_killAsked.isCompleted) _killAsked.complete();
+    return result.then((_) {});
+  }
 }
 
 /// Runs commands, having asked first.
@@ -478,6 +538,7 @@ class Executor {
   }) {
     final out = StreamController<List<int>>();
     final err = StreamController<List<int>>();
+    final killAsked = Completer<void>();
     final result =
         _start(
           argv,
@@ -486,6 +547,7 @@ class Executor {
           taps: taps,
           input: input,
           printed: (out: out, err: err),
+          killAsked: killAsked,
         ).whenComplete(() {
           unawaited(out.close());
           unawaited(err.close());
@@ -495,6 +557,7 @@ class Executor {
       out.stream.transform(decoder),
       err.stream.transform(decoder),
       result,
+      killAsked,
     );
   }
 
@@ -512,7 +575,10 @@ class Executor {
     final (exitCode, refused) = switch (notRun) {
       _NoCommand() || _OutsideTree() || _NotApproved() => (-1, true),
       _NoSuchProgram() => (127, false),
-      _NoProcessGroup() || _NoSuchFolder() || _CouldNotStart() => (-1, false),
+      _NoProcessGroup() ||
+      _NoSuchFolder() ||
+      _KilledBeforeStart() ||
+      _CouldNotStart() => (-1, false),
     };
     return ExecResult(
       exitCode: exitCode,
@@ -533,6 +599,8 @@ class Executor {
       StreamController<List<int>> err,
     })?
     printed,
+    // [Running.kill]'s; null for [run], whose caller has no way to kill.
+    Completer<void>? killAsked,
   }) async {
     if (argv.isEmpty || argv.first.trim().isEmpty) return const _NoCommand();
 
@@ -559,8 +627,12 @@ class Executor {
     }
 
     final request = ExecRequest(argv: argv, cwd: cwd);
+    // The gate is asked before [start] returns, so no kill can come before
+    // it; one can come while it is waited for, since a person can take a
+    // while to answer.
     final allowed = await consent(request);
     if (!allowed) return const _NotApproved();
+    if (killAsked?.isCompleted ?? false) return const _KilledBeforeStart();
 
     // A timeout must kill everything the command started, not just the
     // process we hold. So the command starts through [_shim], which makes
@@ -597,7 +669,7 @@ class Executor {
     final err = BytesBuilder(copy: false);
     // One timer, started by the first chunk of output and restarted by each
     // one after: it fires only after [quiet] with nothing printed mid-run.
-    final silence = Completer<void>();
+    final silence = Completer<Duration>();
     // Output is captured, and passed on, until the result is returned. A
     // leftover that keeps printing after that is not this command's output,
     // and keeping it would grow these buffers for as long as it runs.
@@ -610,7 +682,7 @@ class Executor {
       if (quiet == null || decided) return;
       hush?.cancel();
       hush = startTimer(ExecTimer.quiet, quiet, () {
-        if (!silence.isCompleted) silence.complete();
+        if (!silence.isCompleted) silence.complete(quiet);
       });
     }
 
@@ -645,51 +717,17 @@ class Executor {
       }),
     );
 
-    // A timeout kills the tree: holding the process (and its group) is what
-    // makes "killed" true rather than merely "no longer waited for".
-    var timedOut = false;
-    var silent = false;
-    int? code;
-    final overdue = Completer<void>();
-    final deadline = startTimer(ExecTimer.timeout, timeout, () {
-      if (!overdue.isCompleted) overdue.complete();
-    });
-    switch (await Future.any<_Ending>([
-      proc.exitCode.then(_Exited.new),
-      silence.future.then((_) => const _WentSilent()),
-      overdue.future.then((_) => const _Overdue()),
-    ])) {
-      case _Exited(:final exitCode):
-        code = exitCode;
-      case _WentSilent():
-        silent = true;
-      case _Overdue():
-        timedOut = true;
-    }
-    deadline.cancel();
-    decided = true;
-    hush?.cancel();
-    if (silent && beforeSilentKill != null) {
-      await _within(
-        ExecTimer.look,
-        lookWait,
-        beforeSilentKill!(proc.pid).catchError((Object _) {}),
-      );
-      // It may have finished while it was being looked at: then it was not
-      // stuck, and it has a real exit code to report.
-      if (exited) {
-        silent = false;
-        code = await proc.exitCode;
-      }
-    }
-    if (timedOut || silent) {
-      // While the group has members its id is not reused, so this reaches
-      // only what the command started. Once the group is empty, the id could
-      // name another group only if a new process took this pid and made
-      // itself a leader in the moment since the command was reaped.
+    // A kill reaches the whole group: holding the process (and its group) is
+    // what makes "killed" true rather than merely "no longer waited for".
+    // While the group has members its id is not reused, so this reaches only
+    // what the command started. Once the group is empty, the id could name
+    // another group only if a new process took this pid and made itself a
+    // leader in the moment since the command was reaped.
+    Future<void> killGroup() async {
       Process.killPid(-proc.pid, ProcessSignal.sigkill);
       // The process itself too: the shim, if it had not made its group yet.
-      proc.kill(ProcessSignal.sigkill);
+      // Not once it has been reaped, when its pid could be another's.
+      if (!exited) proc.kill(ProcessSignal.sigkill);
       // A member that was forking when the signal went out has a child born
       // into the group a moment later, which the signal never reached. It is
       // still a member, so the group is signalled until it has none; the
@@ -702,10 +740,61 @@ class Executor {
         await paused.future;
       }
     }
+
+    WhyKilled? whyKilled;
+    int? code;
+    final overdue = Completer<void>();
+    final deadline = startTimer(ExecTimer.timeout, timeout, () {
+      if (!overdue.isCompleted) overdue.complete();
+    });
+    switch (await Future.any<_Ending>([
+      proc.exitCode.then(_Exited.new),
+      silence.future.then(_WentSilent.new),
+      overdue.future.then((_) => const _Overdue()),
+      if (killAsked != null) killAsked.future.then((_) => const _KillAsked()),
+    ])) {
+      case _Exited(:final exitCode):
+        code = exitCode;
+      case _WentSilent(:final quiet):
+        whyKilled = KilledForSilence(quiet);
+      case _Overdue():
+        whyKilled = const KilledForTimeout();
+      case _KillAsked():
+        whyKilled = const KilledOnRequest();
+    }
+    deadline.cancel();
+    decided = true;
+    hush?.cancel();
+    if (whyKilled is KilledForSilence && beforeSilentKill != null) {
+      await _within(
+        ExecTimer.look,
+        lookWait,
+        beforeSilentKill!(proc.pid).catchError((Object _) {}),
+      );
+      // It may have finished while it was being looked at: then it was not
+      // stuck, and it has a real exit code to report.
+      if (exited) {
+        whyKilled = null;
+        code = await proc.exitCode;
+      }
+    }
+    Future<void>? killing;
+    if (whyKilled != null) {
+      await (killing = killGroup());
+    } else if (killAsked != null) {
+      // It ended by itself, and a grandchild may still hold its pipes: a
+      // kill asked for while they drain reaches what it left in its group.
+      unawaited(
+        killAsked.future.then((_) {
+          if (capturing) killing ??= killGroup();
+        }),
+      );
+    }
     // A grandchild can inherit the pipes and hold them open after its parent
     // dies, so the drain is bounded too. Whatever was captured is reported.
     await _within(ExecTimer.drain, drainWait, drained);
     capturing = false;
+    await killing;
 
     // Decoded leniently: output that is not UTF-8 (`cat` or `git` on a binary)
     // is still output, not an error.
@@ -713,11 +802,10 @@ class Executor {
         utf8.decode(b.takeBytes(), allowMalformed: true);
     return ExecStarted(
       ExecResult(
-        exitCode: timedOut || silent ? -1 : (code ?? -1),
+        exitCode: whyKilled == null ? (code ?? -1) : -1,
         stdout: text(out),
         stderr: text(err),
-        timedOut: timedOut,
-        silentFor: silent ? quiet : null,
+        whyKilled: whyKilled,
       ),
     );
   }
@@ -784,11 +872,16 @@ final class _Exited extends _Ending {
 }
 
 final class _WentSilent extends _Ending {
-  const _WentSilent();
+  const _WentSilent(this.quiet);
+  final Duration quiet;
 }
 
 final class _Overdue extends _Ending {
   const _Overdue();
+}
+
+final class _KillAsked extends _Ending {
+  const _KillAsked();
 }
 
 /// [dir] as a shell's PWD would name it: absolute, with `.` and `..` folded
