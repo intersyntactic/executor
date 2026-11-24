@@ -2,7 +2,7 @@ name: is_executor
 description: >-
   Runs programs in a directory, having asked first, each in a process group
   of its own so a timeout kills everything it started.
-version: 0.2.0
+version: 0.3.0
 repository: https://github.com/intersyntactic/executor
 
 environment:
