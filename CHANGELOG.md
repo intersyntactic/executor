@@ -25,8 +25,10 @@
 - `Executor.containment` (default `installDoorstop`) and the sealed
   `ProcessContainment` (`Doorstop`, `NoProcessGroup`). The doorstop ships in
   the package as bytes for linux-x64, linux-arm64, macos-x64 and
-  macos-arm64; on first use it is written to the user's cache folder and run
-  once. Anywhere else, or where it cannot run (a `noexec` cache), commands
+  macos-arm64; once per process it is written into a new folder of that
+  process's own in the system temp folder and run once with `--probe`, which
+  also says whether it can adopt orphans (`Doorstop.adoptsOrphans`).
+  Anywhere else, or where it cannot run (a `noexec` temp folder), commands
   are refused with the reason, as on Windows.
 - Breaking: `startInOwnGroup`, `GroupProcess`, `ProcessLedger` and
   `groupAlive` are removed (`groupAlive` asked `pgrep` about a group id after

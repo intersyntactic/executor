@@ -74,6 +74,22 @@ void main() {
     expect(r.stdout, 'hi\n');
   });
 
+  test(
+    'an empty PATH entry is the working folder, before and at the exec',
+    () async {
+      final tool = File('${tree.path}/here-only')
+        ..writeAsStringSync('#!/bin/sh\necho found\n');
+      expect(Process.runSync('chmod', ['+x', tool.path]).exitCode, 0);
+      final r = await Executor(
+        root: tree,
+        consent: (_) async => true,
+        childPath: () => ':/usr/bin:/bin',
+      ).run(['here-only'], taps: ExecTaps.none);
+      expect(r.exitCode, 0, reason: r.stderr);
+      expect(r.stdout, 'found\n');
+    },
+  );
+
   test('a file with no #! line is not run through a shell', () async {
     // execvp would hand it to /bin/sh (ENOEXEC), and argv is never a shell.
     final script = File('${tree.path}/noshebang')
@@ -189,54 +205,42 @@ void main() {
   });
 
   group('installing', () {
-    // A cache is used only on a path nobody else can write, and the system
-    // temp folder is world-writable on Linux: these caches go under HOME.
-    late Directory home;
-    setUp(() {
-      home = (Directory(
-        '${Platform.environment['HOME']}/.cache',
-      )..createSync(recursive: true)).createTempSync('is_executor_test_');
-    });
-    tearDown(() => home.deleteSync(recursive: true));
-
-    test('a cache under a world-writable folder is not used', () async {
-      final shared = Directory('${home.path}/shared')..createSync();
-      expect(Process.runSync('chmod', ['777', shared.path]).exitCode, 0);
-      final cache = Directory('${shared.path}/cache');
-      final c = await installDoorstopIn(cache, Abi.current()) as Doorstop;
-      expect(c.path, isNot(startsWith(shared.path)));
-      expect(cache.existsSync(), isFalse);
-    });
-
     test('a platform with no build is refused, not run', () async {
-      final c = await installDoorstopIn(null, Abi.linuxRiscv64);
+      final c = await installDoorstopIn(tree, Abi.linuxRiscv64);
       expect(c, isA<NoProcessGroup>());
     });
 
-    test('a cache that cannot be written is refused', () async {
-      final notAFolder = File('${home.path}/file')..writeAsStringSync('x');
+    test('a folder that cannot be written in is refused', () async {
+      final notAFolder = File('${tree.path}/file')..writeAsStringSync('x');
       final c = await installDoorstopIn(
-        Directory('${notAFolder.path}/cache'),
+        Directory(notAFolder.path),
         Abi.current(),
       );
       expect(c, isA<NoProcessGroup>());
     });
 
-    test('a cached doorstop that lost its x bit is written afresh', () async {
-      final cache = Directory('${home.path}/cache');
-      final first = await installDoorstopIn(cache, Abi.current()) as Doorstop;
-      expect(Process.runSync('chmod', ['-x', first.path]).exitCode, 0);
-      final again = await installDoorstopIn(cache, Abi.current());
-      expect(again, isA<Doorstop>());
+    test(
+      'each install is a folder of its own, 0700, nobody else can write',
+      () async {
+        final a = await installDoorstopIn(tree, Abi.current()) as Doorstop;
+        final b = await installDoorstopIn(tree, Abi.current()) as Doorstop;
+        expect(a.path, isNot(b.path));
+        final mode = File(a.path).parent.statSync().mode & 0x1ff;
+        expect(mode, 0x1c0, reason: 'mode ${mode.toRadixString(8)}'); // 0700
+      },
+    );
+
+    test('the doorstop says whether it can adopt orphans', () async {
+      final d = await installDoorstopIn(tree, Abi.current()) as Doorstop;
+      // Linux allows it unless a sandbox denies the prctl; macOS has none.
+      expect(d.adoptsOrphans, Platform.isLinux);
     });
 
-    test('an install runs, and a second reuses the file', () async {
-      final cache = Directory('${home.path}/cache');
-      final first = await installDoorstopIn(cache, Abi.current());
-      final second = await installDoorstopIn(cache, Abi.current());
-      expect(first, isA<Doorstop>());
-      expect((second as Doorstop).path, (first as Doorstop).path);
-      expect(cache.listSync(), hasLength(1));
+    test('installDoorstop installs again once its file has gone', () async {
+      final first = await installDoorstop() as Doorstop;
+      File(first.path).deleteSync();
+      final again = await installDoorstop() as Doorstop;
+      expect(File(again.path).existsSync(), isTrue);
     });
   });
 

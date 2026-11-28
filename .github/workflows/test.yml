@@ -42,7 +42,7 @@ jobs:
       - run: dart run tool/print_containment.dart
       - run: dart test
 
-  # A cache folder that is writable but mounted noexec: the doorstop is
+  # A temp folder that is writable but mounted noexec: the doorstop is
   # written, will not run, and commands are refused rather than run without
   # a process group.
   noexec-cache:
@@ -53,14 +53,11 @@ jobs:
       - run: dart pub get
       - run: |
           sudo mkdir -p /mnt/noexec
-          # mode=0700: a world-writable cache is not used at all (anyone could
-          # replace what is run from it), so this one must be private to be
-          # the cache under test.
           sudo mount -t tmpfs -o noexec,mode=0700,uid=$(id -u) tmpfs /mnt/noexec
       - name: refused, with a reason
         run: |
           set +e
-          XDG_CACHE_HOME=/mnt/noexec dart run tool/print_containment.dart > out.txt
+          TMPDIR=/mnt/noexec dart run tool/print_containment.dart > out.txt
           code=$?
           cat out.txt
           test "$code" -eq 1 && grep -q '^none: ' out.txt

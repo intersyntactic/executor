@@ -25,11 +25,13 @@ What that promises, by platform:
 | A timeout or `kill()` reaches the command's group | yes | yes |
 | A kill reaches only processes the command started | yes | yes |
 | The host dying (crash, `kill -9`, Ctrl-C) kills the command's group | yes | yes |
-| ...and a daemon it started that left the group | yes | no |
-| The doorstop killed from outside takes the command with it | yes¹ | no |
+| ...and a daemon it started that left the group | yes¹ | no |
+| The doorstop killed from outside takes the command with it | yes² | no |
 | How the command ended: exit code or signal | yes | yes |
 
-¹ Unless the command changed user (a setuid program), which clears it.
+¹ Unless a sandbox denies the doorstop the subreaper prctl; `Doorstop.adoptsOrphans`
+says which, as the doorstop found when it was installed.
+² Unless the command changed user (a setuid program), which clears it.
 
 What a kill left, and what a run left running, are what could be seen: a
 scan of running processes observes, it does not prove. `ExecResult.cleanup`
@@ -40,8 +42,13 @@ The doorstop ships inside this package as bytes
 the C source; CI rebuilds it and fails on any difference). Build it with zig
 0.15.2 as ziglang.org ships it (`ZIG=<path>` if it is not first on PATH): a
 packaged zig of the same version, such as Homebrew's, builds with the system's
-clang and makes different bytes, and the tool refuses it. On first
-use it is written to the user's cache folder and run once with `--probe`.
-Where there is no build for the platform, or it cannot be run there (a cache
-mounted `noexec`), commands are refused with the reason, as on Windows, rather
-than run without a process group.
+clang and makes different bytes, and the tool refuses it.
+
+Once per process it is written into a new folder of that process's own in the
+system temp folder (mkdtemp: 0700, never one that was there before) and run
+once with `--probe`. There is no shared cache: a file kept at a known path is
+one someone else may be able to replace between its check and its run.
+Where there is no build for the platform, or it cannot be run there (a temp
+folder mounted `noexec`; set `TMPDIR` to one that is not), commands are
+refused with the reason, as on Windows, rather than run without a process
+group.

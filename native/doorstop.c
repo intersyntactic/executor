@@ -1,7 +1,7 @@
 // doorstop: the parent of a command is_executor runs.
 //
 //   doorstop <socket> <command> [args...]    run the command for the host
-//   doorstop --probe                         exit 0: this file can be run
+//   doorstop --probe                         exit 0, printing `subreaper <0|1>`
 //
 // The doorstop holds the command unreaped after it exits, so the command's
 // pid and process group cannot be reused, and it is the only process that
@@ -441,7 +441,12 @@ static void start_custody(struct Killing *k, int subtree) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 2 && !strcmp(argv[1], "--probe")) return 0;
+  // Runs, and says what it can do here: whether orphans can be adopted (a
+  // seccomp profile can deny it), so the host can say what it promises.
+  if (argc == 2 && !strcmp(argv[1], "--probe")) {
+    printf("subreaper %d\n", set_subreaper());
+    return 0;
+  }
   if (argc < 3) { fprintf(stderr, "usage: doorstop <socket> <command> [args...] | --probe\n"); return 125; }
   close_from(3);  // whatever the host left open beyond stdio is not ours to hold
   s = socket(AF_UNIX, SOCK_STREAM, 0);

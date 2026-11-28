@@ -1219,12 +1219,13 @@ String _pwd(Directory dir) {
 /// Whether [executable] names a file: itself when it has a `/`, else in one
 /// of [path]'s directories. A relative name or directory is read from
 /// [from], the directory the command starts in, when it is given, as the exec
-/// that starts it reads one; else from this process's.
+/// that starts it reads one; else from this process's. An empty entry is the
+/// current folder, as POSIX has it and as the doorstop's own search reads it.
 bool _onPath(String executable, String path, {String? from}) {
   String at(String p) => from == null || p.startsWith('/') ? p : '$from/$p';
   if (executable.contains('/')) return File(at(executable)).existsSync();
   return path
       .split(':')
-      .where((d) => d.isNotEmpty)
+      .map((d) => d.isEmpty ? '.' : d)
       .any((d) => File('${at(d)}/$executable').existsSync());
 }

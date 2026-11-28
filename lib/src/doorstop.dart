@@ -20,13 +20,18 @@ sealed class ProcessContainment {
 
 /// Each command starts under the doorstop at [path]: in a process group of
 /// its own that a kill reaches whole, held so its ids stay its own, and
-/// killed with what it started if this process dies. On Linux, that last
-/// reaches even a process that left the group (a daemon); on macOS, the
-/// group only.
+/// killed with what it started if this process dies. When [adoptsOrphans]
+/// (Linux, where nothing denies it), that last reaches even a process that
+/// left the group (a daemon); otherwise (macOS, or a sandbox that refuses
+/// it) the group only.
 final class Doorstop extends ProcessContainment {
-  const Doorstop._(this.path);
+  const Doorstop._(this.path, {required this.adoptsOrphans});
 
   final String path;
+
+  /// Whether the doorstop can be the parent of orphans the command leaves,
+  /// as the doorstop found when it was installed.
+  final bool adoptsOrphans;
 }
 
 /// No command can be run here as the leader of a process group of its own,
@@ -37,140 +42,61 @@ final class NoProcessGroup extends ProcessContainment {
   final String reason;
 }
 
-Future<Doorstop>? _installed;
+Doorstop? _installed;
 
-/// Puts this platform's doorstop where it can be run, in the user's cache
-/// folder. Once it is there, every later call answers at once; a refusal is
-/// not kept, so one that a moment fixes (a cache briefly full) is asked again.
+/// Puts this platform's doorstop where it can be run, once per process (and
+/// again if it has gone: an OS cleaner can remove a temp file under a
+/// long-lived process). A refusal is not kept, so one that a moment fixes
+/// is asked again.
 Future<ProcessContainment> installDoorstop() async {
   final done = _installed;
-  if (done != null) return done;
-  final c = await installDoorstopIn(_cacheFolder(), Abi.current());
-  if (c case final Doorstop d) _installed ??= Future.value(d);
+  if (done != null && await File(done.path).exists()) return done;
+  final c = await installDoorstopIn(Directory.systemTemp, Abi.current());
+  if (c case final Doorstop d) _installed = d;
   return c;
 }
 
-/// Puts the doorstop built for [abi] in [cache], and runs it once to see it
-/// can be run there (a folder mounted noexec cannot).
-Future<ProcessContainment> installDoorstopIn(Directory? cache, Abi abi) async {
+/// Writes the doorstop built for [abi] into a new folder of this process's
+/// own inside [root], and runs it once to see it can be run there (a folder
+/// mounted noexec cannot) and what it can do.
+///
+/// A folder of its own, made by mkdtemp: 0700, never one that was there
+/// before, so nobody else can have made it or can write in it. In the system
+/// temp folder, whose parent is sticky (`/tmp`) or the user's own (macOS),
+/// nobody else can rename it either. That is why there is no shared cache: a
+/// file kept at a known path is one someone else may be able to replace
+/// between its check and its run, and a check of who owns a path cannot be
+/// made from Dart.
+Future<ProcessContainment> installDoorstopIn(Directory root, Abi abi) async {
   if (Platform.isWindows) {
     return const NoProcessGroup('Windows has no process groups to run in');
   }
   final build = doorstopBuilds[abi];
   if (build == null) return NoProcessGroup('no doorstop is built for $abi');
-  final bytes = base64.decode(build.base64);
   try {
-    // A file this runs must be one no stranger can replace. The cache folder
-    // is used only when no folder on its path is world-writable (see
-    // [_private]). Else (no cache, or one under a shared folder such as /tmp)
-    // a folder of this process's own, which mkdtemp makes 0700 and fails
-    // rather than reuse.
-    final useCache = cache != null && await _private(cache);
-    final folder = useCache
-        ? cache
-        : await Directory.systemTemp.createTemp('is_executor_');
-    if (useCache && !await folder.exists()) {
-      await folder.create(recursive: true);
-      // Its own folder, made here: nobody else's to write in.
-      await Process.run('/bin/chmod', ['700', folder.path]);
+    final folder = await root.createTemp('is_executor_');
+    final file = File('${folder.path}/doorstop');
+    await file.writeAsBytes(base64.decode(build.base64), flush: true);
+    // By its full path: an app opened from Finder can have no /bin on PATH.
+    final chmod = await Process.run('/bin/chmod', ['755', file.path]);
+    if (chmod.exitCode != 0) {
+      return NoProcessGroup('could not make ${file.path} runnable');
     }
-    final file = File('${folder.path}/doorstop-${build.sha256}');
-    if (!await _holds(file, bytes)) await _put(folder, file, bytes);
-    // A file with the right bytes can still refuse to run (its mode lost
-    // `x`): written afresh once before the refusal is believed.
-    if (!await _runs(file)) {
-      await _put(folder, file, bytes);
-      if (!await _runs(file)) {
-        return NoProcessGroup('the doorstop at ${file.path} would not run');
-      }
+    final probe = await Process.run(file.path, ['--probe']);
+    if (probe.exitCode != 0) {
+      return NoProcessGroup(
+        'the doorstop at ${file.path} would not run (exit ${probe.exitCode})',
+      );
     }
-    return Doorstop._(file.path);
-  } on _NotRunnable catch (e) {
-    return NoProcessGroup(e.why);
+    // cast-ok: Process.run decodes stdout to a String
+    final said = (probe.stdout as String).trim();
+    // wire-ok: the probe's one line, read once here
+    return Doorstop._(file.path, adoptsOrphans: said == 'subreaper 1');
   } on FileSystemException catch (e) {
     return NoProcessGroup('could not install the doorstop: ${e.message}');
   } on ProcessException catch (e) {
     return NoProcessGroup('the doorstop would not run: ${e.message}');
   }
-}
-
-/// Whether no folder from [folder] up to `/` that exists is writable by
-/// everyone, so no stranger can have made or can change any part of the
-/// path. A group-writable one is allowed: with user-private groups (the
-/// Debian and Ubuntu default, umask 002) a user's own folders are, and that
-/// group holds only the user. On a shared group, its members could replace
-/// the doorstop. A folder not there yet will be made by this process.
-Future<bool> _private(Directory folder) async {
-  var at = folder.absolute;
-  while (true) {
-    final stat = await at.stat();
-    if (stat.type != FileSystemEntityType.notFound && stat.mode & 0x2 != 0) {
-      return false; // 0o002: world-writable
-    }
-    final up = at.parent;
-    if (up.path == at.path) return true;
-    at = up;
-  }
-}
-
-/// Writes [bytes] to [file], runnable: in a folder of its own beside it and
-/// renamed into place, so another installer at the same moment (another
-/// process, or another isolate of this one) never runs or overwrites a
-/// half-written file.
-Future<void> _put(Directory folder, File file, List<int> bytes) async {
-  final scratch = await folder.createTemp('.doorstop-');
-  try {
-    final part = File('${scratch.path}/doorstop');
-    await part.writeAsBytes(bytes, flush: true);
-    // By its full path: an app opened from Finder can have no /bin on PATH.
-    final chmod = await Process.run('/bin/chmod', ['755', part.path]);
-    if (chmod.exitCode != 0) {
-      throw _NotRunnable('could not make ${part.path} runnable');
-    }
-    await part.rename(file.path);
-  } finally {
-    await scratch.delete(recursive: true).catchError((Object _) => scratch);
-  }
-}
-
-/// Whether [file] runs: `--probe` exits 0. A folder mounted noexec refuses
-/// the exec itself.
-Future<bool> _runs(File file) async {
-  try {
-    return (await Process.run(file.path, ['--probe'])).exitCode == 0;
-  } on ProcessException {
-    return false;
-  }
-}
-
-/// An install step failed for [why].
-final class _NotRunnable implements Exception {
-  const _NotRunnable(this.why);
-
-  final String why;
-}
-
-Future<bool> _holds(File file, List<int> bytes) async {
-  if (!await file.exists()) return false;
-  final there = await file.readAsBytes();
-  if (there.length != bytes.length) return false;
-  for (var i = 0; i < bytes.length; i++) {
-    if (there[i] != bytes[i]) return false;
-  }
-  return true;
-}
-
-/// The user's cache folder for this package, or null when there is no home.
-Directory? _cacheFolder() {
-  final env = Platform.environment;
-  final home = env['HOME'];
-  final xdg = env['XDG_CACHE_HOME'];
-  if (Platform.isMacOS && home != null) {
-    return Directory('$home/Library/Caches/is_executor');
-  }
-  if (xdg != null && xdg.startsWith('/')) return Directory('$xdg/is_executor');
-  if (home != null) return Directory('$home/.cache/is_executor');
-  return null;
 }
 
 /// What the doorstop says, one line each.
