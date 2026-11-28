@@ -29,6 +29,9 @@ import 'dart:typed_data' show BytesBuilder;
 
 import 'package:is_path_confinement/is_path_confinement.dart';
 
+import 'doorstop.dart';
+import 'outcome.dart';
+
 /// The decision this library refuses to make for you.
 ///
 /// Returns true to allow. Called once per invocation, with the fully resolved
@@ -89,12 +92,27 @@ class ExecResult {
   /// the command had exited: what it left was killed, and its code stands.
   final WhyKilled? whyKilled;
 
+  /// How the command itself ended, as its parent saw it: an exit code, or
+  /// the signal that ended it (which [exitCode] cannot tell from "no code").
+  /// Null for a command that was not started.
+  final Termination? termination;
+
+  /// What the kill left, when the executor killed the group.
+  final Cleanup cleanup;
+
+  /// What the command left running once the run was over, seen while its
+  /// ids were still held; null when it was not started or could not be seen.
+  final Leftovers? leftovers;
+
   const ExecResult({
     required this.exitCode,
     required this.stdout,
     required this.stderr,
     this.refused = false,
     this.whyKilled,
+    this.termination,
+    this.cleanup = const NotKilled(),
+    this.leftovers,
   });
 
   /// Killed for running past [Executor.timeout].
@@ -131,7 +149,12 @@ class ExecResult {
         'printed more than $limit bytes on ${channel.name}, so the rest was '
             'cut and it was killed; '
             '${exitCode == -1 ? 'no exit code' : 'exit $exitCode'}',
-      null => 'exit $exitCode',
+      null => switch (termination) {
+        TerminationUnknown() =>
+          'its doorstop was lost, so how it ended is not known; no exit code',
+        Signalled(:final signal) => 'ended by signal $signal; no exit code',
+        Exited() || null => 'exit $exitCode',
+      },
     });
     if (stdout.trim().isNotEmpty) {
       b.write('\n--- stdout ---\n${stdout.trimRight()}');
@@ -220,13 +243,14 @@ final class _NoCommand extends ExecNotStarted {
 /// This host can start no command as the leader of a process group of its
 /// own, so a timeout could not kill what the command starts.
 final class _NoProcessGroup extends ExecNotStarted {
-  const _NoProcessGroup();
+  const _NoProcessGroup(this.reason);
+
+  final String reason;
 
   @override
   String get why =>
-      'not run: this host has neither setsid nor perl, so the command could '
-      'not be put in a process group of its own, and a timeout could not kill '
-      'what it starts';
+      'not run: the command could not be put in a process group of its own, '
+      'so a timeout could not kill what it starts ($reason)';
 }
 
 /// The working directory, [folder] as it was given, resolves outside the
@@ -329,10 +353,10 @@ class ExecTaps {
   final ProcessTap? onProcess;
 }
 
-/// [pid] leads the command's process group (see [Executor.run]): hand it to
-/// [groupAlive] when the STEP is over to learn whether anything the command
-/// started is still running -- including a leftover that redirected its
-/// output and so let go of the pipes.
+/// [pid] is the command's, and its process group's id (see [Executor.run]),
+/// for showing a person; what it left running is [ExecResult.leftovers].
+/// Nothing here signals by it, and a caller that does is outside what the
+/// executor holds: once the run is over the id can be another process's.
 typedef ProcessTap = void Function(int pid, List<String> argv, bool ended);
 
 void _tellProcess(ProcessTap? tap, int pid, List<String> argv, bool ended) {
@@ -341,39 +365,6 @@ void _tellProcess(ProcessTap? tap, int pid, List<String> argv, bool ended) {
     tap(pid, argv, ended);
   } on Object catch (_) {
     // A display callback failing must not fail the command.
-  }
-}
-
-/// Remembers the processes one call started, so that when the call is over
-/// [leaked] can say which of them left something running. One per call.
-class ProcessLedger {
-  final _leaders = <int>{};
-
-  /// An [ExecTaps.onProcess] that records each process and then tells
-  /// [next], if any.
-  ProcessTap track([ProcessTap? next]) => (pid, argv, ended) {
-    _leaders.add(pid);
-    next?.call(pid, argv, ended);
-  };
-
-  /// The pids whose process group still has members. Asked once, by the
-  /// caller, when the call is over -- not on a timer.
-  Future<List<int>> leaked() async => [
-    for (final pid in _leaders)
-      if (await groupAlive(pid)) pid,
-  ];
-}
-
-/// Whether any process is still in the group [leader] started (the pid an
-/// [Executor] command was given). Asked once, by the caller, at the moment it
-/// cares (the end of a step) -- not on a timer. True when `pgrep` cannot be
-/// run: a question that could not be asked is not an answer that nothing is
-/// left, and a leftover reported by mistake is seen where a missed one is not.
-Future<bool> groupAlive(int leader) async {
-  try {
-    return (await Process.run('pgrep', ['-g', '$leader'])).exitCode == 0;
-  } on ProcessException {
-    return true;
   }
 }
 
@@ -424,7 +415,10 @@ class Executor {
 
   /// Told when a child starts and when it has exited, with its pid -- for a
   /// host that watches for one that runs suspiciously long (the server's
-  /// stall watch). Exit is reported however the run ends, killed included.
+  /// stall watch). Exit is reported when the command is seen to end, killed
+  /// included; a command still running when its run returns (stuck in the
+  /// kernel after a kill) is not reported as exited. One that throws is
+  /// ignored, and the run goes on.
   final void Function(int pid, ExecRequest request)? onStarted;
   final void Function(int pid)? onExited;
 
@@ -455,14 +449,15 @@ class Executor {
   /// How long a run waits, once the command has ended, for its pipes to close.
   static const drainWait = Duration(seconds: 2);
 
-  /// How long a run waits for a command it killed to exit: one blocked in
-  /// the kernel does not die even of SIGKILL until the call returns.
+  /// How long a run waits for its doorstop to answer (started, a kill's
+  /// result, what is left), and for a command it killed to exit: one blocked
+  /// in the kernel does not die even of SIGKILL until the call returns. The
+  /// doorstop's own kill gives up answering after a second, inside this.
   static const killWait = Duration(seconds: 5);
 
-  /// How far apart a group not yet empty is signalled again, and how many
-  /// times at most: long enough for a fork in flight to finish.
-  static const resignalPause = Duration(milliseconds: 5);
-  static const resignalTries = 200;
+  /// Where commands run from, and what that promises ([ProcessContainment]):
+  /// [installDoorstop] unless a test gives its own.
+  final Future<ProcessContainment> Function() containment;
 
   Executor({
     required this.root,
@@ -473,6 +468,7 @@ class Executor {
     this.beforeSilentKill,
     this.startTimer = realTimer,
     this.childPath = ownChildPath,
+    this.containment = installDoorstop,
   });
 
   /// [startTimer]'s default: the role does not change how long a real timer
@@ -648,13 +644,19 @@ class Executor {
         : workingSubdir.startsWith('/')
         ? Directory(workingSubdir)
         : Directory('${root.path}/$workingSubdir');
-    final shim = _shim;
-    if (shim == null) return const _NoProcessGroup();
+    final String doorstop;
+    switch (await containment()) {
+      case Doorstop(:final path):
+        doorstop = path;
+      case NoProcessGroup(:final reason):
+        return _NoProcessGroup(reason);
+    }
     if (!isInsideTree(root, cwd.absolute.path)) {
       return _OutsideTree(workingSubdir ?? '');
     }
-    // Asked before starting: through the shim, a program that is not there
-    // starts and exits 127, like one that ran and failed. The folder first,
+    // Asked before the gate, so nobody is asked to approve a program that
+    // is not there. Not the last word: one removed after this is still
+    // reported as missing, by the doorstop's failed exec. The folder first,
     // because a relative program is looked for from it.
     if (!cwd.existsSync()) return _NoSuchFolder(cwd.path);
     final path = childPath();
@@ -670,36 +672,29 @@ class Executor {
     if (!allowed) return const _NotApproved();
     if (killAsked?.isCompleted ?? false) return const _KilledBeforeStart();
 
-    // A timeout must kill everything the command started, not just the
-    // process we hold. So the command starts through [_shim], which makes
-    // itself the leader of a new session and process group and then execs the
-    // command in its place: the pid we hold is the group's id, what the
-    // command starts joins the group unless it makes a session or group of its
-    // own, and the exit code is the command's. dart:io cannot start a process
-    // in a new group without detaching it (dart-lang/sdk#22470).
+    // A timeout must kill everything the command started, and a kill must
+    // reach only that. So the command starts under the doorstop, its parent:
+    // the command leads a new session and process group, and the doorstop
+    // holds it unreaped once it exits, so neither id can be another
+    // process's until the run lets go. Only the doorstop signals; this asks
+    // it to, over a unix socket. dart:io can neither start a process in a
+    // new group without detaching it (dart-lang/sdk#22470) nor keep its own
+    // children unreaped.
     final Process proc;
-    try {
-      proc = await Process.start(
-        shim.executable,
-        [...shim.arguments, ...argv],
-        workingDirectory: cwd.path,
-        // PWD too: a shell sets it from the directory it starts in, and a
-        // command exec'd directly would otherwise inherit this process's.
-        environment: {'PATH': path, 'PWD': _pwd(cwd)},
-        runInShell: false, // argv is argv, and there is no other way in
-      );
-    } on ProcessException catch (e) {
-      // ENOENT here means EITHER the shim or the working directory is
-      // missing (one removed since it was looked for); the OS does not say
-      // which. Say which one it was.
-      return cwd.existsSync()
-          ? _CouldNotStart('${e.message}: ${argv.first}')
-          : _NoSuchFolder(cwd.path);
+    final DoorstopLink link;
+    final int pid;
+    switch (await _startUnder(doorstop, argv, cwd, path)) {
+      case _NotLaunched(:final why):
+        return why;
+      case _Launched(proc: final p, link: final l, pid: final c):
+        proc = p;
+        link = l;
+        pid = c;
     }
-    onStarted?.call(proc.pid, request);
+    _observe(() => onStarted?.call(pid, request));
     final processTap = taps.onProcess;
     unawaited(_feedStdin(proc, input));
-    _tellProcess(processTap, proc.pid, argv, false);
+    _tellProcess(processTap, pid, argv, false);
 
     final out = _Capture(maxOutputBytes, printed?.out);
     final err = _Capture(maxOutputBytes, printed?.err);
@@ -752,40 +747,36 @@ class Executor {
     unawaited(
       drained
           .then<void>((_) {}, onError: (Object _) {})
-          .then((_) => _tellProcess(processTap, proc.pid, argv, true)),
+          .then((_) => _tellProcess(processTap, pid, argv, true)),
     );
     // Done when the command is, NOT when the pipes close -- a backgrounded
     // grandchild can hold them open long after the command itself has exited.
-    var exited = false;
+    // Exit is told when the doorstop says the command ended, and only then:
+    // a run can return before that (a command stuck in the kernel after a
+    // kill), and must not tell observers that a live process exited.
+    Termination? termination;
     unawaited(
-      proc.exitCode.then((_) {
-        exited = true;
-        onExited?.call(proc.pid);
+      link.ended.future.then((how) {
+        termination = how;
+        _observe(() => onExited?.call(pid));
       }),
     );
 
-    // A kill reaches the whole group: holding the process (and its group) is
-    // what makes "killed" true rather than merely "no longer waited for".
-    // While the group has members its id is not reused, so this reaches only
-    // what the command started. Once the group is empty, the id could name
-    // another group only if a new process took this pid and made itself a
-    // leader in the moment since the command was reaped.
+    // A kill reaches the whole group, and only it: the doorstop holds the
+    // command unreaped, so the group's id stays the command's, and the
+    // doorstop alone signals it. A member forking as the signal goes out has
+    // a child born into the group a moment later; the doorstop signals again
+    // until two looks in a row see nobody, or a second has passed.
+    Cleanup cleanup = const NotKilled();
     Future<void> killGroup() async {
-      Process.killPid(-proc.pid, ProcessSignal.sigkill);
-      // The process itself too: the shim, if it had not made its group yet.
-      // Not once it has been reaped, when its pid could be another's.
-      if (!exited) proc.kill(ProcessSignal.sigkill);
-      // A member that was forking when the signal went out has a child born
-      // into the group a moment later, which the signal never reached. It is
-      // still a member, so the group is signalled until it has none; the
-      // limit keeps one that never empties from holding the result.
-      await _within(ExecTimer.kill, killWait, proc.exitCode);
-      for (var i = 0; i < resignalTries; i++) {
-        if (!Process.killPid(-proc.pid, ProcessSignal.sigkill)) break;
-        final paused = Completer<void>();
-        startTimer(ExecTimer.resignal, resignalPause, paused.complete);
-        await paused.future;
-      }
+      cleanup =
+          await _upTo(ExecTimer.answer, killWait, link.kill()) ??
+          const CleanupUnknown();
+      // One blocked in the kernel does not die even of SIGKILL until the
+      // call returns: waited for, but not for ever.
+      termination ??=
+          await _upTo(ExecTimer.kill, killWait, link.ended.future) ??
+          const TerminationUnknown();
     }
 
     WhyKilled? whyKilled;
@@ -795,14 +786,20 @@ class Executor {
       if (!overdue.isCompleted) overdue.complete();
     });
     switch (await Future.any<_Ending>([
-      proc.exitCode.then(_Exited.new),
+      link.ended.future.then(_EndedByItself.new),
+      link.lost.future.then((_) => const _DoorstopLost()),
       silence.future.then(_WentSilent.new),
       overdue.future.then((_) => const _Overdue()),
       if (killAsked != null) killAsked.future.then((_) => const _KillAsked()),
       overflow.future.then(_Overflowed.new),
     ])) {
-      case _Exited(:final exitCode):
-        code = exitCode;
+      case _EndedByItself(:final how):
+        code = how.asExitCode;
+      case _DoorstopLost():
+        // Nothing can be signalled now: the ids are no longer held. How it
+        // ended, and what it left, are not known.
+        termination = const TerminationUnknown();
+        cleanup = const CleanupUnknown();
       case _WentSilent(:final quiet):
         whyKilled = KilledForSilence(quiet);
       case _Overdue():
@@ -819,19 +816,21 @@ class Executor {
       await _within(
         ExecTimer.look,
         lookWait,
-        beforeSilentKill!(proc.pid).catchError((Object _) {}),
+        // Future.sync: one that throws before returning a future is caught too.
+        Future<void>.sync(() => beforeSilentKill!(pid))
+            .catchError((Object _) {}),
       );
       // It may have finished while it was being looked at: then it was not
       // stuck, and it has a real exit code to report.
-      if (exited) {
+      if (termination case final how?) {
         whyKilled = null;
-        code = await proc.exitCode;
+        code = how.asExitCode;
       }
     }
     Future<void>? killing;
     if (whyKilled != null) {
       await (killing = killGroup());
-    } else {
+    } else if (!link.lost.isCompleted) {
       // It ended by itself, and a grandchild may still hold its pipes: a
       // kill asked for while they drain, or output past the limit, reaches
       // what it left in its group.
@@ -850,6 +849,16 @@ class Executor {
     // Output cut once the command had exited is said too, beside its own
     // exit code.
     whyKilled ??= overflowed;
+    // What it left, asked while the ids are still held; then the doorstop is
+    // let go. After a kill that left something, it goes on killing the group
+    // by itself until none is seen, so this run need not wait for that.
+    final leftovers = await _upTo(ExecTimer.answer, killWait, link.leftovers());
+    switch (cleanup) {
+      case Incomplete() || CleanupUnknown():
+        link.abandon();
+      case NotKilled() || NoneSeen():
+        link.release();
+    }
 
     return ExecStarted(
       ExecResult(
@@ -857,9 +866,138 @@ class Executor {
         stdout: out.text,
         stderr: err.text,
         whyKilled: whyKilled,
+        termination: termination ?? const TerminationUnknown(),
+        cleanup: cleanup,
+        leftovers: leftovers,
       ),
     );
   }
+
+  /// Starts [argv] under the [doorstop], in [cwd] with [path] as its PATH,
+  /// and waits until the doorstop has said whether the exec succeeded.
+  Future<_Launch> _startUnder(
+    String doorstop,
+    List<String> argv,
+    Directory cwd,
+    String path,
+  ) async {
+    // A folder of this process's own (0700), so nobody else can connect.
+    final Directory folder;
+    try {
+      folder = await Directory.systemTemp.createTemp('is_executor_');
+    } on FileSystemException catch (e) {
+      return _NotLaunched(
+        _CouldNotStart('no folder for the doorstop socket: ${e.message}'),
+      );
+    }
+    final socketPath = '${folder.path}/s';
+    final ServerSocket server;
+    try {
+      server = await ServerSocket.bind(
+        InternetAddress(socketPath, type: InternetAddressType.unix),
+        0,
+      );
+    } on SocketException catch (e) {
+      await _remove(folder);
+      return _NotLaunched(_CouldNotStart('no socket for the doorstop: $e'));
+    }
+    final Process proc;
+    try {
+      proc = await Process.start(
+        doorstop,
+        [socketPath, ...argv],
+        workingDirectory: cwd.path,
+        // PWD too: a shell sets it from the directory it starts in, and a
+        // command exec'd directly would otherwise inherit this process's.
+        environment: {'PATH': path, 'PWD': _pwd(cwd)},
+        runInShell: false, // argv is argv, and there is no other way in
+      );
+    } on ProcessException catch (e) {
+      await server.close();
+      await _remove(folder);
+      // ENOENT here means EITHER the doorstop or the working directory is
+      // missing (one removed since it was looked for); the OS does not say
+      // which. Say which one it was.
+      return _NotLaunched(
+        cwd.existsSync()
+            ? _CouldNotStart('${e.message}: ${argv.first}')
+            : _NoSuchFolder(cwd.path),
+      );
+    }
+    // Connected, or the doorstop exited first (it could not connect), or
+    // neither within the wait. The doorstop is never signalled: whatever it
+    // is doing, it exits by itself once it has no socket.
+    final socket = await _upTo(
+      ExecTimer.answer,
+      killWait,
+      Future.any<Socket?>([server.first, proc.exitCode.then((_) => null)]),
+    );
+    await server.close();
+    await _remove(folder);
+    if (socket == null) {
+      final said = await _upTo(
+        ExecTimer.answer,
+        killWait,
+        proc.stderr.transform(utf8.decoder).join(),
+      );
+      _letGoOf(proc, stderrTaken: true);
+      return _NotLaunched(
+        _CouldNotStart('the doorstop did not start: ${said ?? ''}'.trim()),
+      );
+    }
+    final link = DoorstopLink(socket);
+    final started = await _upTo(
+      ExecTimer.answer,
+      killWait,
+      link.started.future,
+    );
+    final exec = started == null
+        ? null
+        : await _upTo(ExecTimer.answer, killWait, link.exec.future);
+    if (started == null || exec == null) {
+      link.abandon();
+      _letGoOf(proc);
+      return const _NotLaunched(
+        _CouldNotStart('the doorstop did not say whether the command started'),
+      );
+    }
+    switch (exec) {
+      case DoorstopExecFailed(:final errno):
+        link.release();
+        _letGoOf(proc);
+        return _NotLaunched(
+          errno == _enoent
+              ? _NoSuchProgram(argv.first)
+              : _CouldNotStart('${_errnoText(errno)}: ${argv.first}'),
+        );
+      case DoorstopExecRan():
+        return _Launched(proc: proc, link: link, pid: started.pid);
+    }
+  }
+
+  /// Lets go of a doorstop whose command will not run here: its stdin closed
+  /// (else this process holds the pipe's write end until the [Process] is
+  /// collected) and what it prints drained; its stderr only when nothing has
+  /// read it yet ([stderrTaken]), since a stream is listened to once.
+  static void _letGoOf(Process proc, {bool stderrTaken = false}) {
+    unawaited(proc.stdin.close().then<void>((_) {}, onError: (Object _) {}));
+    unawaited(proc.stdout.drain<void>().catchError((Object _) {}));
+    if (!stderrTaken) {
+      unawaited(proc.stderr.drain<void>().catchError((Object _) {}));
+    }
+  }
+
+  /// Waits for [work], for no longer than [bound]: its value, or null.
+  Future<T?> _upTo<T>(ExecTimer role, Duration bound, Future<T> work) {
+    final over = Completer<T?>();
+    final timer = startTimer(role, bound, () {
+      if (!over.isCompleted) over.complete(null);
+    });
+    return Future.any<T?>([work, over.future]).whenComplete(timer.cancel);
+  }
+
+  static Future<void> _remove(Directory folder) =>
+      folder.delete(recursive: true).then((_) {}, onError: (Object _) {});
 
   /// Feed input alongside output collection: a command can print before it
   /// reads, and awaiting the write first could deadlock both pipes. An early
@@ -884,6 +1022,52 @@ class Executor {
   }
 }
 
+/// Calls an observer the caller gave ([Executor.onStarted],
+/// [Executor.onExited]). One that throws must not unwind the run that owns
+/// the command: the command would be left with no timeout and no cleanup.
+void _observe(void Function() call) {
+  try {
+    call();
+  } on Object catch (_) {
+    // An observer failing is the observer's; the run goes on.
+  }
+}
+
+/// How [Executor._startUnder] went.
+sealed class _Launch {
+  const _Launch();
+}
+
+final class _Launched extends _Launch {
+  const _Launched({required this.proc, required this.link, required this.pid});
+
+  /// The doorstop: its stdin, stdout and stderr are the command's.
+  final Process proc;
+  final DoorstopLink link;
+
+  /// The command's.
+  final int pid;
+}
+
+final class _NotLaunched extends _Launch {
+  const _NotLaunched(this.why);
+
+  final ExecNotStarted why;
+}
+
+/// ENOENT: the same number on Linux and macOS.
+const _enoent = 2;
+
+/// What an errno from a failed exec means. These numbers are the same on
+/// Linux and macOS.
+String _errnoText(int errno) => switch (errno) {
+  1 => 'not permitted',
+  8 => 'not a program this system can run',
+  13 => 'permission denied',
+  20 => 'a part of the path is not a folder',
+  _ => 'could not be run (errno $errno)',
+};
+
 /// What a timer an [Executor] run starts is for.
 enum ExecTimer {
   /// [Executor.timeout] has passed: the command is killed.
@@ -898,8 +1082,9 @@ enum ExecTimer {
   /// [Executor.killWait] has passed: a killed command is not waited for.
   kill,
 
-  /// [Executor.resignalPause] has passed: its group is signalled again.
-  resignal,
+  /// [Executor.killWait] has passed: the doorstop's answer is not waited
+  /// for (that it started, what a kill left, what is still running).
+  answer,
 
   /// [Executor.drainWait] has passed: the pipes are no longer waited for.
   drain,
@@ -917,9 +1102,13 @@ sealed class _Ending {
   const _Ending();
 }
 
-final class _Exited extends _Ending {
-  const _Exited(this.exitCode);
-  final int exitCode;
+final class _EndedByItself extends _Ending {
+  const _EndedByItself(this.how);
+  final Termination how;
+}
+
+final class _DoorstopLost extends _Ending {
+  const _DoorstopLost();
 }
 
 final class _WentSilent extends _Ending {
@@ -1027,135 +1216,16 @@ String _pwd(Directory dir) {
   return p.length > 1 && p.endsWith('/') ? p.substring(0, p.length - 1) : p;
 }
 
-/// How a command starts as the leader of a new session and process group: a
-/// program that makes itself one and then execs its arguments in place, so
-/// the pid that was started is the group's id and the exit code is the
-/// command's. `setsid` if there is one, else perl (macOS has no `setsid`),
-/// looked for in /usr/bin and /bin and then in the absolute directories on
-/// this process's PATH: every command starts through this one program, so a
-/// system copy wins and a relative entry, which would name a different file
-/// from each working directory, is never used. Null on Windows, or when
-/// neither is found, and then [Executor.run] runs nothing.
-/// `setsid` execs in place unless it already leads a group, which a child of
-/// this process never does. The perl program reads the group back rather
-/// than trusting the call's return value, and dies rather than run the
-/// command outside a group of its own; when the exec fails, it exits 127 for
-/// a missing program and 126 otherwise, as `setsid` and a shell do. `--` ends
-/// each one's options, so the command is never read as one.
-final _Shim? _shim = () {
-  if (Platform.isWindows) return null;
-  final dirs = [
-    '/usr/bin',
-    '/bin',
-    ...?Platform.environment['PATH']
-        ?.split(':')
-        .where((d) => d.startsWith('/')),
-  ];
-  for (final (name, arguments) in const [
-    ('setsid', ['--']),
-    ('perl', ['-e', _perlShim, '--']),
-  ]) {
-    for (final d in dirs) {
-      final f = File('$d/$name');
-      if (f.existsSync()) return (executable: f.path, arguments: arguments);
-    }
-  }
-  return null;
-}();
-
-typedef _Shim = ({String executable, List<String> arguments});
-
-/// A process started as the leader of a group of its own ([startInOwnGroup]),
-/// and how to signal everything it started.
-final class GroupProcess {
-  GroupProcess._(this.process, this._grouped);
-
-  final Process process;
-
-  /// False where the host has no way to start a group ([_shim] is null, as on
-  /// Windows): [kill] then reaches only [process].
-  final bool _grouped;
-
-  /// Sends [signal] to the group: the process and whatever it started that
-  /// has not made a group of its own. While the group has members its id is
-  /// not reused, so this reaches only what the process started; once it is
-  /// empty, the id could name another group only if a new process took this
-  /// pid and made itself a leader in the moment since this one was reaped.
-  /// True if the signal reached anything.
-  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
-    if (!_grouped) return process.kill(signal);
-    final group = Process.killPid(-process.pid, signal);
-    // The process itself too: the shim, if it had not made its group yet.
-    return process.kill(signal) || group;
-  }
-}
-
-/// Starts [executable] through the same shim as [Executor.run], so it leads
-/// a session and process group of its own and [GroupProcess.kill] reaches
-/// what it starts. Where there is no shim (Windows) it starts directly.
-///
-/// Throws [ProcessException] when [executable] is not found, as
-/// [Process.start] does: through the shim a missing program would otherwise
-/// start, and exit 127.
-Future<GroupProcess> startInOwnGroup(
-  String executable,
-  List<String> arguments, {
-  String? workingDirectory,
-  Map<String, String>? environment,
-}) async {
-  final shim = _shim;
-  if (shim == null) {
-    return GroupProcess._(
-      await Process.start(
-        executable,
-        arguments,
-        workingDirectory: workingDirectory,
-        environment: environment,
-      ),
-      false,
-    );
-  }
-  final path =
-      (environment ?? Platform.environment)['PATH'] ??
-      Platform.environment['PATH'] ??
-      '';
-  if (!_onPath(executable, path)) {
-    throw ProcessException(
-      executable,
-      arguments,
-      'No such file or directory',
-      2,
-    );
-  }
-  return GroupProcess._(
-    await Process.start(
-      shim.executable,
-      [...shim.arguments, executable, ...arguments],
-      workingDirectory: workingDirectory,
-      environment: environment,
-    ),
-    true,
-  );
-}
-
 /// Whether [executable] names a file: itself when it has a `/`, else in one
 /// of [path]'s directories. A relative name or directory is read from
 /// [from], the directory the command starts in, when it is given, as the exec
-/// that starts it reads one; else from this process's.
+/// that starts it reads one; else from this process's. An empty entry is the
+/// current folder, as POSIX has it and as the doorstop's own search reads it.
 bool _onPath(String executable, String path, {String? from}) {
   String at(String p) => from == null || p.startsWith('/') ? p : '$from/$p';
   if (executable.contains('/')) return File(at(executable)).existsSync();
   return path
       .split(':')
-      .where((d) => d.isNotEmpty)
+      .map((d) => d.isEmpty ? '.' : d)
       .any((d) => File('${at(d)}/$executable').existsSync());
 }
-
-const _perlShim = r'''
-use POSIX ();
-POSIX::setsid();
-die "setsid failed: $!\n" unless getpgrp(0) == $$;
-exec { $ARGV[0] } @ARGV;
-print STDERR "$ARGV[0]: $!\n";
-exit($!{ENOENT} ? 127 : 126);
-''';
