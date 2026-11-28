@@ -1,8 +1,8 @@
 /// A run's processes reach its caller through the [ExecTaps] it was given:
 /// one report when the process starts, one when it has let go of stdout and
 /// stderr -- which is later than the command's exit if a grandchild still
-/// holds the pipes. And when a call is over, a [ProcessLedger] says which
-/// processes left something running in their group, pipes or no pipes.
+/// holds the pipes. And when a call is over, its result says what the
+/// command left running in its group, pipes or no pipes.
 @TestOn('!windows')
 library;
 
@@ -102,51 +102,49 @@ void main() {
     expect(r.exitCode, 0);
   });
 
-  group('ProcessLedger.leaked, at the end of a call', () {
-    // Runs [script] with a fresh ledger, and returns what it says leaked.
+  group('ExecResult.leftovers, seen while the ids are held', () {
+    // Runs [script] and returns what its result says it left running.
     // [said] completes at the first line of output.
-    Future<List<int>> leaked(String script, {Completer<void>? said}) async {
-      final ledger = ProcessLedger();
+    Future<Leftovers?> left(String script, {Completer<void>? said}) async {
       int? leader;
-      await runReportingLines(
+      final r = await runReportingLines(
         executor(),
         ['/bin/sh', '-c', script],
-        taps: ExecTaps(onProcess: ledger.track((pid, _, _) => leader ??= pid)),
+        taps: ExecTaps(onProcess: (pid, _, _) => leader ??= pid),
         onLine: (_) {
           if (said != null && !said.isCompleted) said.complete();
         },
       );
-      // Do not leave a leftover behind.
+      // Do not leave a leftover behind. By group id, after the run has let
+      // go of it: a test's cleanup, not something the library does.
       addTearDown(() => Process.killPid(-leader!, ProcessSignal.sigkill));
-      return ledger.leaked();
+      return r.leftovers;
     }
 
-    test('a background process that redirected its output is found', () async {
+    test('a background process that redirected its output is seen', () async {
       // It let go of the pipes (so the pipes alone say "ended"), yet it runs.
-      expect(
-        await leaked('sleep 30 >/dev/null 2>&1 & echo launched'),
-        hasLength(1),
-      );
+      final l = await left('sleep 30 >/dev/null 2>&1 & echo launched');
+      expect(l?.inGroup, 1);
     });
 
-    test('a background process still holding the pipes is found', () async {
+    test('a background process still holding the pipes is seen', () async {
       final said = Completer<void>();
       passDrains(said.future);
-      expect(
-        await leaked('sleep 30 & echo launched', said: said),
-        hasLength(1),
-      );
+      final l = await left('sleep 30 & echo launched', said: said);
+      expect(l?.inGroup, 1);
     });
 
-    test('a command that cleaned up after itself is not', () async {
-      expect(await leaked('echo clean'), isEmpty);
+    test('a command that cleaned up after itself leaves nothing', () async {
+      final l = await left('echo clean');
+      expect(l?.any, isFalse);
     });
 
-    test('a command killed on timeout leaves nothing to find', () async {
+    test('a command killed on timeout leaves nothing to see', () async {
       timers.started.listen((t) {
         if (t.role == ExecTimer.timeout) t.fire();
       });
-      expect(await leaked('sleep 30'), isEmpty);
+      final l = await left('sleep 30');
+      expect(l?.inGroup, 0);
     });
   });
 }

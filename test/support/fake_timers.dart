@@ -8,10 +8,8 @@ import 'dart:async';
 import 'package:is_executor/is_executor.dart';
 
 final class FakeTimers {
-  /// [real] are left to the clock. By default that is the pause between
-  /// signals to a group not yet empty: it is a deadline nobody waits on, only
-  /// time for a fork in flight to finish, which is what a kill test checks.
-  FakeTimers({this.real = const {ExecTimer.resignal}});
+  /// [real] are left to the clock; by default none is.
+  FakeTimers({this.real = const {}});
 
   final Set<ExecTimer> real;
   final _all = <FakeTimer>[];

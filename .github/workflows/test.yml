@@ -1,9 +1,10 @@
 name: test
 
-# On both hosts, because they start a process group differently: Linux has
-# `setsid`, macOS has none and uses the perl shim. Weekly as well, because
-# what the tests check can break with no change here: a new runner image, a
-# new Dart SDK, a macOS without perl.
+# On every platform a doorstop is built for, on fresh runners: each run
+# writes the doorstop from the package's bytes into a cache, probes it and
+# runs the suite through it, which is the only proof the shipped bytes run
+# there. Weekly as well, because what the tests check can break with no
+# change here: a new runner image, a new Dart SDK, a new kernel.
 
 on:
   push:
@@ -14,15 +15,49 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The committed bytes are what native/doorstop.c builds.
+  bytes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dart-lang/setup-dart@v1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: dart pub get
+      - run: dart run tool/build_doorstop.dart --check
+
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dart-lang/setup-dart@v1
       - run: dart pub get
       - run: dart analyze --fatal-infos
+      # The bytes, written and probed on a machine that has never seen them.
+      - run: dart run tool/print_containment.dart
       - run: dart test
+
+  # A cache folder that is writable but mounted noexec: the doorstop is
+  # written, will not run, and commands are refused rather than run without
+  # a process group.
+  noexec-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dart-lang/setup-dart@v1
+      - run: dart pub get
+      - run: |
+          sudo mkdir -p /mnt/noexec
+          sudo mount -t tmpfs -o noexec,uid=$(id -u) tmpfs /mnt/noexec
+      - name: refused, with a reason
+        run: |
+          set +e
+          XDG_CACHE_HOME=/mnt/noexec dart run tool/print_containment.dart > out.txt
+          code=$?
+          cat out.txt
+          test "$code" -eq 1 && grep -q '^none: ' out.txt

@@ -1,3 +1,42 @@
+## 0.4.0
+
+- Every command starts under the doorstop (`native/doorstop.c`), its
+  parent, in place of the `setsid`/perl shim. The doorstop keeps the command
+  unreaped after it exits, so its pid and process group cannot be given to
+  another process while the run needs them, and it alone signals them: this
+  library no longer signals anything. A kill, a timeout, silence or output
+  past the limit asks it to kill the group; it signals again until two looks
+  in a row see nothing, so a member forking as the signal goes out is caught.
+- The host dying (a crash, `kill -9`, Ctrl-C to its group) now kills the
+  command's group, where before it left the command running in a session of
+  its own. On Linux it also kills a daemon the command started that left the
+  group (the doorstop is its subreaper). On Linux, the doorstop killed from
+  outside takes the command with it.
+- `ExecResult.termination`, a sealed `Termination` (`Exited`, `Signalled`,
+  `TerminationUnknown`): how the command ended. A death by SIGHUP was -1,
+  the same as "no exit code"; it is now `Signalled(1)`, and `forModel` says
+  so. `exitCode` is unchanged.
+- `ExecResult.cleanup`, a sealed `Cleanup` (`NotKilled`, `NoneSeen`,
+  `Incomplete`, `CleanupUnknown`): what a kill left, as far as could be
+  seen. After `Incomplete`, the doorstop goes on killing by itself once the
+  run has returned.
+- `ExecResult.leftovers`: what the command left running when its run was
+  over, seen while its ids were still held.
+- `Executor.containment` (default `installDoorstop`) and the sealed
+  `ProcessContainment` (`Doorstop`, `NoProcessGroup`). The doorstop ships in
+  the package as bytes for linux-x64, linux-arm64, macos-x64 and
+  macos-arm64; on first use it is written to the user's cache folder and run
+  once. Anywhere else, or where it cannot run (a `noexec` cache), commands
+  are refused with the reason, as on Windows.
+- Breaking: `startInOwnGroup`, `GroupProcess`, `ProcessLedger` and
+  `groupAlive` are removed (`groupAlive` asked `pgrep` about a group id after
+  its leader had been reaped, when the id could be another's;
+  `ExecResult.leftovers` replaces both it and the ledger).
+  `Executor.resignalPause`, `Executor.resignalTries` and `ExecTimer.resignal`
+  are removed; `ExecTimer.answer` is new. A missing program is still refused
+  before the consent gate is asked; one removed after that check is reported
+  as missing too, from the failed exec.
+
 ## 0.3.0
 
 - `start` takes `maxOutputBytes`: how much a command may print on stdout,
