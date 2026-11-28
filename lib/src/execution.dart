@@ -415,7 +415,10 @@ class Executor {
 
   /// Told when a child starts and when it has exited, with its pid -- for a
   /// host that watches for one that runs suspiciously long (the server's
-  /// stall watch). Exit is reported however the run ends, killed included.
+  /// stall watch). Exit is reported when the command is seen to end, killed
+  /// included; a command still running when its run returns (stuck in the
+  /// kernel after a kill) is not reported as exited. One that throws is
+  /// ignored, and the run goes on.
   final void Function(int pid, ExecRequest request)? onStarted;
   final void Function(int pid)? onExited;
 
@@ -688,7 +691,7 @@ class Executor {
         link = l;
         pid = c;
     }
-    onStarted?.call(pid, request);
+    _observe(() => onStarted?.call(pid, request));
     final processTap = taps.onProcess;
     unawaited(_feedStdin(proc, input));
     _tellProcess(processTap, pid, argv, false);
@@ -748,18 +751,14 @@ class Executor {
     );
     // Done when the command is, NOT when the pipes close -- a backgrounded
     // grandchild can hold them open long after the command itself has exited.
+    // Exit is told when the doorstop says the command ended, and only then:
+    // a run can return before that (a command stuck in the kernel after a
+    // kill), and must not tell observers that a live process exited.
     Termination? termination;
-    var toldExited = false;
-    void tellExited() {
-      if (toldExited) return;
-      toldExited = true;
-      onExited?.call(pid);
-    }
-
     unawaited(
       link.ended.future.then((how) {
         termination = how;
-        tellExited();
+        _observe(() => onExited?.call(pid));
       }),
     );
 
@@ -817,7 +816,9 @@ class Executor {
       await _within(
         ExecTimer.look,
         lookWait,
-        beforeSilentKill!(pid).catchError((Object _) {}),
+        // Future.sync: one that throws before returning a future is caught too.
+        Future<void>.sync(() => beforeSilentKill!(pid))
+            .catchError((Object _) {}),
       );
       // It may have finished while it was being looked at: then it was not
       // stuck, and it has a real exit code to report.
@@ -858,7 +859,6 @@ class Executor {
       case NotKilled() || NoneSeen():
         link.release();
     }
-    tellExited();
 
     return ExecStarted(
       ExecResult(
@@ -882,7 +882,14 @@ class Executor {
     String path,
   ) async {
     // A folder of this process's own (0700), so nobody else can connect.
-    final folder = await Directory.systemTemp.createTemp('is_executor_');
+    final Directory folder;
+    try {
+      folder = await Directory.systemTemp.createTemp('is_executor_');
+    } on FileSystemException catch (e) {
+      return _NotLaunched(
+        _CouldNotStart('no folder for the doorstop socket: ${e.message}'),
+      );
+    }
     final socketPath = '${folder.path}/s';
     final ServerSocket server;
     try {
@@ -1012,6 +1019,17 @@ class Executor {
       if (!over.isCompleted) over.complete();
     });
     return Future.any<void>([work, over.future]).whenComplete(timer.cancel);
+  }
+}
+
+/// Calls an observer the caller gave ([Executor.onStarted],
+/// [Executor.onExited]). One that throws must not unwind the run that owns
+/// the command: the command would be left with no timeout and no cleanup.
+void _observe(void Function() call) {
+  try {
+    call();
+  } on Object catch (_) {
+    // An observer failing is the observer's; the run goes on.
   }
 }
 

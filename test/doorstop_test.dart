@@ -61,6 +61,19 @@ void main() {
     expect(r.forModel, startsWith('ended by signal 1'));
   });
 
+  test('an observer that throws does not stop the run it observes', () async {
+    // The command is already running when onStarted is called: unwinding
+    // there would leave it with no timeout and no cleanup.
+    final r = await Executor(
+      root: tree,
+      consent: (_) async => true,
+      onStarted: (_, _) => throw StateError('observer bug'),
+      onExited: (_) => throw StateError('observer bug'),
+    ).run(['/bin/sh', '-c', 'echo hi'], taps: ExecTaps.none);
+    expect(r.exitCode, 0);
+    expect(r.stdout, 'hi\n');
+  });
+
   test('a file with no #! line is not run through a shell', () async {
     // execvp would hand it to /bin/sh (ENOEXEC), and argv is never a shell.
     final script = File('${tree.path}/noshebang')
@@ -176,13 +189,32 @@ void main() {
   });
 
   group('installing', () {
+    // A cache is used only on a path nobody else can write, and the system
+    // temp folder is world-writable on Linux: these caches go under HOME.
+    late Directory home;
+    setUp(() {
+      home = (Directory(
+        '${Platform.environment['HOME']}/.cache',
+      )..createSync(recursive: true)).createTempSync('is_executor_test_');
+    });
+    tearDown(() => home.deleteSync(recursive: true));
+
+    test('a cache under a world-writable folder is not used', () async {
+      final shared = Directory('${home.path}/shared')..createSync();
+      expect(Process.runSync('chmod', ['777', shared.path]).exitCode, 0);
+      final cache = Directory('${shared.path}/cache');
+      final c = await installDoorstopIn(cache, Abi.current()) as Doorstop;
+      expect(c.path, isNot(startsWith(shared.path)));
+      expect(cache.existsSync(), isFalse);
+    });
+
     test('a platform with no build is refused, not run', () async {
       final c = await installDoorstopIn(null, Abi.linuxRiscv64);
       expect(c, isA<NoProcessGroup>());
     });
 
     test('a cache that cannot be written is refused', () async {
-      final notAFolder = File('${tree.path}/file')..writeAsStringSync('x');
+      final notAFolder = File('${home.path}/file')..writeAsStringSync('x');
       final c = await installDoorstopIn(
         Directory('${notAFolder.path}/cache'),
         Abi.current(),
@@ -191,7 +223,7 @@ void main() {
     });
 
     test('a cached doorstop that lost its x bit is written afresh', () async {
-      final cache = Directory('${tree.path}/cache');
+      final cache = Directory('${home.path}/cache');
       final first = await installDoorstopIn(cache, Abi.current()) as Doorstop;
       expect(Process.runSync('chmod', ['-x', first.path]).exitCode, 0);
       final again = await installDoorstopIn(cache, Abi.current());
@@ -199,7 +231,7 @@ void main() {
     });
 
     test('an install runs, and a second reuses the file', () async {
-      final cache = Directory('${tree.path}/cache');
+      final cache = Directory('${home.path}/cache');
       final first = await installDoorstopIn(cache, Abi.current());
       final second = await installDoorstopIn(cache, Abi.current());
       expect(first, isA<Doorstop>());

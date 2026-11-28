@@ -60,11 +60,20 @@ Future<ProcessContainment> installDoorstopIn(Directory? cache, Abi abi) async {
   if (build == null) return NoProcessGroup('no doorstop is built for $abi');
   final bytes = base64.decode(build.base64);
   try {
-    // With no cache folder, a folder of this process's own: a shared one
-    // could be written by someone else between the check and the run.
-    final folder =
-        cache ?? await Directory.systemTemp.createTemp('is_executor_');
-    await folder.create(recursive: true);
+    // A file this runs must be one no stranger can replace. The cache folder
+    // is used only when no folder on its path is world-writable (see
+    // [_private]). Else (no cache, or one under a shared folder such as /tmp)
+    // a folder of this process's own, which mkdtemp makes 0700 and fails
+    // rather than reuse.
+    final useCache = cache != null && await _private(cache);
+    final folder = useCache
+        ? cache
+        : await Directory.systemTemp.createTemp('is_executor_');
+    if (useCache && !await folder.exists()) {
+      await folder.create(recursive: true);
+      // Its own folder, made here: nobody else's to write in.
+      await Process.run('/bin/chmod', ['700', folder.path]);
+    }
     final file = File('${folder.path}/doorstop-${build.sha256}');
     if (!await _holds(file, bytes)) await _put(folder, file, bytes);
     // A file with the right bytes can still refuse to run (its mode lost
@@ -82,6 +91,25 @@ Future<ProcessContainment> installDoorstopIn(Directory? cache, Abi abi) async {
     return NoProcessGroup('could not install the doorstop: ${e.message}');
   } on ProcessException catch (e) {
     return NoProcessGroup('the doorstop would not run: ${e.message}');
+  }
+}
+
+/// Whether no folder from [folder] up to `/` that exists is writable by
+/// everyone, so no stranger can have made or can change any part of the
+/// path. A group-writable one is allowed: with user-private groups (the
+/// Debian and Ubuntu default, umask 002) a user's own folders are, and that
+/// group holds only the user. On a shared group, its members could replace
+/// the doorstop. A folder not there yet will be made by this process.
+Future<bool> _private(Directory folder) async {
+  var at = folder.absolute;
+  while (true) {
+    final stat = await at.stat();
+    if (stat.type != FileSystemEntityType.notFound && stat.mode & 0x2 != 0) {
+      return false; // 0o002: world-writable
+    }
+    final up = at.parent;
+    if (up.path == at.path) return true;
+    at = up;
   }
 }
 

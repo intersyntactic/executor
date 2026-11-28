@@ -53,7 +53,10 @@ jobs:
       - run: dart pub get
       - run: |
           sudo mkdir -p /mnt/noexec
-          sudo mount -t tmpfs -o noexec,uid=$(id -u) tmpfs /mnt/noexec
+          # mode=0700: a world-writable cache is not used at all (anyone could
+          # replace what is run from it), so this one must be private to be
+          # the cache under test.
+          sudo mount -t tmpfs -o noexec,mode=0700,uid=$(id -u) tmpfs /mnt/noexec
       - name: refused, with a reason
         run: |
           set +e

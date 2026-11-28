@@ -90,14 +90,27 @@ static int may_signal(uid_t r, uid_t sv) {
   return eme == 0 || me == r || me == sv || eme == r || eme == sv;
 }
 
-// Set when a line could not be sent: a host that is not reading is going.
+// Set when a line could not be sent: the socket failed, or the host has not
+// read for a second. Either way it is gone, and everything is killed, so a
+// full buffer alone (a host busy for a moment) must not set it.
 static int host_gone = 0;
 static int s = -1;  // the socket; -1 once the doorstop stops listening
 static void say(const char *fmt, long a, long b) {
   char line[96];
   int n = snprintf(line, sizeof line, fmt, a, b);
   if (n <= 0 || s < 0 || host_gone) return;
-  if (send(s, line, (size_t)n, MSG_DONTWAIT) != n) host_gone = 1;
+  size_t sent = 0;
+  while (sent < (size_t)n) {
+    ssize_t w = send(s, line + sent, (size_t)n - sent, MSG_DONTWAIT);
+    if (w > 0) { sent += (size_t)w; continue; }
+    if (w < 0 && errno == EINTR) continue;
+    if (w < 0 && errno == EAGAIN) {
+      struct pollfd out = {s, POLLOUT, 0};
+      if (poll(&out, 1, 1000) > 0 && (out.revents & POLLOUT)) continue;
+    }
+    host_gone = 1;
+    return;
+  }
 }
 
 // Whether the command itself is still running: 1 yes, 0 exited, -1 cannot tell.
