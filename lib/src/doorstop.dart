@@ -37,12 +37,18 @@ final class NoProcessGroup extends ProcessContainment {
   final String reason;
 }
 
-Future<ProcessContainment>? _installed;
+Future<Doorstop>? _installed;
 
-/// Puts this platform's doorstop where it can be run, once per process, in
-/// the user's cache folder.
-Future<ProcessContainment> installDoorstop() =>
-    _installed ??= installDoorstopIn(_cacheFolder(), Abi.current());
+/// Puts this platform's doorstop where it can be run, in the user's cache
+/// folder. Once it is there, every later call answers at once; a refusal is
+/// not kept, so one that a moment fixes (a cache briefly full) is asked again.
+Future<ProcessContainment> installDoorstop() async {
+  final done = _installed;
+  if (done != null) return done;
+  final c = await installDoorstopIn(_cacheFolder(), Abi.current());
+  if (c case final Doorstop d) _installed ??= Future.value(d);
+  return c;
+}
 
 /// Puts the doorstop built for [abi] in [cache], and runs it once to see it
 /// can be run there (a folder mounted noexec cannot).
@@ -60,36 +66,60 @@ Future<ProcessContainment> installDoorstopIn(Directory? cache, Abi abi) async {
         cache ?? await Directory.systemTemp.createTemp('is_executor_');
     await folder.create(recursive: true);
     final file = File('${folder.path}/doorstop-${build.sha256}');
-    if (!await _holds(file, bytes)) {
-      // Written in a folder of its own beside it and renamed into place, so
-      // another installer at the same moment (another process, or another
-      // isolate of this one) never runs or overwrites a half-written file.
-      final scratch = await folder.createTemp('.doorstop-');
-      try {
-        final part = File('${scratch.path}/doorstop');
-        await part.writeAsBytes(bytes, flush: true);
-        final chmod = await Process.run('chmod', ['755', part.path]);
-        if (chmod.exitCode != 0) {
-          return NoProcessGroup('could not make ${part.path} runnable');
-        }
-        await part.rename(file.path);
-      } finally {
-        await scratch.delete(recursive: true).catchError((Object _) => scratch);
+    if (!await _holds(file, bytes)) await _put(folder, file, bytes);
+    // A file with the right bytes can still refuse to run (its mode lost
+    // `x`): written afresh once before the refusal is believed.
+    if (!await _runs(file)) {
+      await _put(folder, file, bytes);
+      if (!await _runs(file)) {
+        return NoProcessGroup('the doorstop at ${file.path} would not run');
       }
     }
-    final probe = await Process.run(file.path, ['--probe']);
-    if (probe.exitCode != 0) {
-      return NoProcessGroup(
-        'the doorstop at ${file.path} would not run '
-        '(exit ${probe.exitCode})',
-      );
-    }
     return Doorstop._(file.path);
+  } on _NotRunnable catch (e) {
+    return NoProcessGroup(e.why);
   } on FileSystemException catch (e) {
     return NoProcessGroup('could not install the doorstop: ${e.message}');
   } on ProcessException catch (e) {
     return NoProcessGroup('the doorstop would not run: ${e.message}');
   }
+}
+
+/// Writes [bytes] to [file], runnable: in a folder of its own beside it and
+/// renamed into place, so another installer at the same moment (another
+/// process, or another isolate of this one) never runs or overwrites a
+/// half-written file.
+Future<void> _put(Directory folder, File file, List<int> bytes) async {
+  final scratch = await folder.createTemp('.doorstop-');
+  try {
+    final part = File('${scratch.path}/doorstop');
+    await part.writeAsBytes(bytes, flush: true);
+    // By its full path: an app opened from Finder can have no /bin on PATH.
+    final chmod = await Process.run('/bin/chmod', ['755', part.path]);
+    if (chmod.exitCode != 0) {
+      throw _NotRunnable('could not make ${part.path} runnable');
+    }
+    await part.rename(file.path);
+  } finally {
+    await scratch.delete(recursive: true).catchError((Object _) => scratch);
+  }
+}
+
+/// Whether [file] runs: `--probe` exits 0. A folder mounted noexec refuses
+/// the exec itself.
+Future<bool> _runs(File file) async {
+  try {
+    return (await Process.run(file.path, ['--probe'])).exitCode == 0;
+  } on ProcessException {
+    return false;
+  }
+}
+
+/// An install step failed for [why].
+final class _NotRunnable implements Exception {
+  const _NotRunnable(this.why);
+
+  final String why;
 }
 
 Future<bool> _holds(File file, List<int> bytes) async {
@@ -222,6 +252,11 @@ class DoorstopLink {
           onError: (Object _) => _closed(),
           cancelOnError: true,
         );
+    // A write to a doorstop that has just died fails here, not where it was
+    // written: heard, so it is a lost doorstop and not an uncaught error.
+    unawaited(
+      _socket.done.then<void>((_) {}, onError: (Object _) => _closed()),
+    );
   }
 
   final Socket _socket;

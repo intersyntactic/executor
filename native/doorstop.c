@@ -39,7 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
+#include <time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -74,10 +74,20 @@ static void set_flags(int fd, int nonblock) {
   if (nonblock) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 }
 
+// Monotonic: a wall clock set back would stall every deadline and pause.
 static long now_ms(void) {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return tv.tv_sec * 1000L + tv.tv_usec / 1000;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+// Whether this process may signal one running as real uid r, saved uid sv:
+// root may; otherwise its real or effective uid must be the target's real or
+// saved one. A process that changed user (a setuid program) can be seen but
+// not killed, and is counted apart so it cannot hold custody open for ever.
+static int may_signal(uid_t r, uid_t sv) {
+  uid_t me = getuid(), eme = geteuid();
+  return eme == 0 || me == r || me == sv || eme == r || eme == sv;
 }
 
 // Set when a line could not be sent: a host that is not reading is going.
@@ -102,8 +112,9 @@ static int c_live(pid_t c) {
 
 // One look at what is running: live members of the command's group (the
 // command included, even before it has made the group) and live adopted
-// orphans outside the group. failed: the look could not be taken whole.
-struct Census { int self, group, adopted, failed; };
+// orphans outside the group, each that this process may signal; and those it
+// may not (unkillable). failed: the look could not be taken whole.
+struct Census { int self, group, adopted, unkillable, adopted_unkillable, failed; };
 
 #ifdef __linux__
 // /proc/<p>/stat: state, ppid, pgrp. 1 read, 0 gone, -1 could not look.
@@ -176,12 +187,43 @@ static void reap_adopted(pid_t c) {
   if (n >= 0) free(pids);
 }
 
+// /proc/<p>/status: real and saved uid. 1 read, 0 gone, -1 could not look.
+static int proc_uids(pid_t p, uid_t *r, uid_t *sv) {
+  char path[64], buf[2048];
+  snprintf(path, sizeof path, "/proc/%d/status", (int)p);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return (errno == ENOENT || errno == ESRCH) ? 0 : -1;
+  ssize_t n = read(fd, buf, sizeof buf - 1);
+  int e = errno;
+  close(fd);
+  if (n < 0) return e == ESRCH ? 0 : -1;
+  if (n == 0) return 0;
+  buf[n] = 0;
+  char *u = strstr(buf, "\nUid:");
+  unsigned long rr, ee, ss;
+  if (!u || sscanf(u + 5, "%lu %lu %lu", &rr, &ee, &ss) != 3) return -1;
+  *r = (uid_t)rr;
+  *sv = (uid_t)ss;
+  return 1;
+}
+
+// Adds live process p to k as one this process may signal, or may not.
+// 0 counted or gone, -1 the look failed.
+static int count(pid_t p, int *mayKill, int *mayNot) {
+  uid_t r, sv;
+  int got = proc_uids(p, &r, &sv);
+  if (got < 0) return -1;
+  if (got == 0) return 0;
+  if (may_signal(r, sv)) (*mayKill)++; else (*mayNot)++;
+  return 0;
+}
+
 static struct Census census(pid_t c, int kill_adopted) {
-  struct Census k = {0, 0, 0, 0};
+  struct Census k = {0, 0, 0, 0, 0, 0};
   int self = c_live(c);
   if (self < 0) { k.failed = 1; return k; }
   k.self = self;
-  k.group = self;
+  if (self && count(c, &k.group, &k.unkillable) < 0) { k.failed = 1; return k; }
   DIR *d = opendir("/proc");
   if (!d) { k.failed = 1; return k; }
   struct dirent *e;
@@ -191,7 +233,7 @@ static struct Census census(pid_t c, int kill_adopted) {
     char st; int ppid, pgrp;
     int r = proc_stat(p, &st, &ppid, &pgrp);
     if (r < 0) { k.failed = 1; break; }
-    if (r > 0 && pgrp == c && st != 'Z') k.group++;
+    if (r > 0 && pgrp == c && st != 'Z' && count(p, &k.group, &k.unkillable) < 0) { k.failed = 1; break; }
   }
   closedir(d);
   if (k.failed) return k;
@@ -204,8 +246,9 @@ static struct Census census(pid_t c, int kill_adopted) {
     if (r < 0) { k.failed = 1; break; }
     if (r == 0 || st == 'Z') { waitpid(pids[i], NULL, WNOHANG); continue; }
     if (pgrp == c) continue;  // counted in the group already
-    k.adopted++;
-    if (kill_adopted) kill(pids[i], SIGKILL);
+    int before = k.adopted;
+    if (count(pids[i], &k.adopted, &k.adopted_unkillable) < 0) { k.failed = 1; break; }
+    if (kill_adopted && k.adopted > before) kill(pids[i], SIGKILL);
   }
   free(pids);
   return k;
@@ -229,35 +272,45 @@ static void reap_adopted(pid_t c) { (void)c; }
 // libproc lists the group; the short info call succeeds for any live process
 // (another user's included) and fails with ESRCH for a zombie or one gone.
 // There is no subreaper: adopted is always 0 here, and leftovers says -1.
+// Adds p to k if it is live: as one this process may signal, or may not.
+// 0 counted or gone (a zombie included), -1 the look failed.
+static int count(pid_t p, int *mayKill, int *mayNot) {
+  struct proc_bsdshortinfo si;
+  errno = 0;
+  if (proc_pidinfo(p, PROC_PIDT_SHORTBSDINFO, 0, &si, sizeof si) != (int)sizeof si) {
+    return errno == ESRCH ? 0 : -1;
+  }
+  if (si.pbsi_status == SZOMB) return 0;
+  if (may_signal(si.pbsi_ruid, si.pbsi_svuid)) (*mayKill)++; else (*mayNot)++;
+  return 0;
+}
+
 static struct Census census(pid_t c, int kill_adopted) {
   (void)kill_adopted;
-  struct Census k = {0, 0, 0, 0};
+  struct Census k = {0, 0, 0, 0, 0, 0};
   int self = c_live(c);
   if (self < 0) { k.failed = 1; return k; }
   k.self = self;
-  k.group = self;
+  if (self && count(c, &k.group, &k.unkillable) < 0) { k.failed = 1; return k; }
   int cap = 256, n = 0;
   pid_t *pids = NULL;
   for (;;) {
     pid_t *np = realloc(pids, (size_t)cap * sizeof *pids);
     if (!np) { free(pids); k.failed = 1; return k; }
     pids = np;
+    // Returns 0, not -1, when the call fails, so 0 alone does not mean
+    // empty: the failed call leaves errno set. An empty answer is real
+    // before the command has made its group (or if it died before it could).
+    errno = 0;
     int bytes = proc_listpids(PROC_PGRP_ONLY, (uint32_t)c, pids, cap * (int)sizeof *pids);
-    if (bytes < 0) { free(pids); k.failed = 1; return k; }
+    if (bytes < 0 || (bytes == 0 && errno != 0)) { free(pids); k.failed = 1; return k; }
     n = bytes / (int)sizeof *pids;
     if (n < cap) break;  // room to spare: the list is whole
     cap *= 2;
   }
   for (int i = 0; i < n; i++) {
     if (pids[i] <= 0 || pids[i] == c) continue;
-    struct proc_bsdshortinfo si;
-    errno = 0;
-    if (proc_pidinfo(pids[i], PROC_PIDT_SHORTBSDINFO, 0, &si, sizeof si) == (int)sizeof si) {
-      if (si.pbsi_status != SZOMB) k.group++;
-    } else if (errno != ESRCH) {
-      k.failed = 1;
-      break;
-    }
+    if (count(pids[i], &k.group, &k.unkillable) < 0) { k.failed = 1; break; }
   }
   free(pids);
   return k;
@@ -299,7 +352,10 @@ static int kill_tick(pid_t c, struct Killing *k) {
   kill(c, SIGKILL);   // the doorstop's unreaped child; before setsid there is no group yet
   kill(-c, SIGKILL);  // POSIX: no other group can have c's id while c exists
   struct Census seen = census(c, k->subtree);
+  // What signalling can still end, and what it cannot (another user's): only
+  // the first keeps killing going; both keep the answer from none-seen.
   int left = seen.group + (k->subtree ? seen.adopted : 0);
+  int stuck = seen.unkillable + (k->subtree ? seen.adopted_unkillable : 0);
   long now = now_ms();
   if (seen.failed) {
     k->empties = 0;
@@ -310,8 +366,9 @@ static int kill_tick(pid_t c, struct Killing *k) {
   }
   if (k->answer) {
     if (seen.failed) { say("unknown\n", 0, 0); k->answer = 0; }
+    else if (k->empties >= kEmptyToSee && stuck) { say("incomplete %ld\n", stuck, 0); k->answer = 0; }
     else if (k->empties >= kEmptyToSee) { say("none-seen\n", 0, 0); k->answer = 0; }
-    else if (now >= k->deadline) { say("incomplete %ld\n", left, 0); k->answer = 0; }
+    else if (now >= k->deadline) { say("incomplete %ld\n", left + stuck, 0); k->answer = 0; }
     if (!k->answer && !k->custody) { k->active = 0; return 1; }
   }
   if (k->custody) {
@@ -321,6 +378,43 @@ static int kill_tick(pid_t c, struct Killing *k) {
   }
   k->next = now + (k->custody ? k->pause : kRoundMs);
   return 0;
+}
+
+extern char **environ;
+
+// execve of argv[0], looked for on PATH as a shell does when it has no `/`,
+// but with no shell behind it: execvp runs a file with no #! line through
+// /bin/sh (ENOEXEC), and argv here is argv, never a shell. Returns only on
+// failure, with errno: EACCES if any candidate was found but refused, else
+// the last error.
+static void exec_on_path(char **args) {
+  const char *name = args[0];
+  if (strchr(name, '/')) { execve(name, args, environ); return; }
+  const char *path = getenv("PATH");
+  if (!path) path = "/usr/bin:/bin";
+  size_t nlen = strlen(name);
+  int denied = 0, last = ENOENT;
+  const char *p = path;
+  for (;;) {
+    const char *end = strchr(p, ':');
+    size_t dlen = end ? (size_t)(end - p) : strlen(p);
+    char full[4096];
+    // An empty entry is the current folder, as POSIX has it.
+    if (dlen == 0) { if (nlen + 1 > sizeof full) break; memcpy(full, name, nlen + 1); }
+    else {
+      if (dlen + 1 + nlen + 1 > sizeof full) { last = ENAMETOOLONG; goto next; }
+      memcpy(full, p, dlen);
+      full[dlen] = '/';
+      memcpy(full + dlen + 1, name, nlen + 1);
+    }
+    execve(full, args, environ);
+    if (errno == EACCES) denied = 1;
+    else if (errno != ENOENT && errno != ENOTDIR) { last = errno; break; }
+  next:
+    if (!end) break;
+    p = end + 1;
+  }
+  errno = denied ? EACCES : last;
 }
 
 static void start_custody(struct Killing *k, int subtree) {
@@ -386,7 +480,7 @@ int main(int argc, char **argv) {
     sigaction(SIGPIPE, &dfl, NULL);
     sigaction(SIGCHLD, &dfl, NULL);
     if (setsid() < 0) { int e = errno; (void)!write(ep[1], &e, sizeof e); _exit(126); }
-    execvp(argv[2], argv + 2);
+    exec_on_path(argv + 2);
     int e = errno;
     (void)!write(ep[1], &e, sizeof e);
     _exit(e == ENOENT ? 127 : 126);
@@ -457,10 +551,13 @@ int main(int argc, char **argv) {
         } else if (!strcmp(line, "leftovers")) {
           struct Census seen = census(c, 0);
           if (seen.failed) say("leftovers unknown\n", 0, 0);
+          // Everything still running, killable or not; the command itself
+          // (counted in one or the other while it lives) is not a leftover.
 #ifdef __linux__
-          else say("leftovers group %ld adopted %ld\n", seen.group - seen.self, seen.adopted);
+          else say("leftovers group %ld adopted %ld\n", seen.group + seen.unkillable - seen.self,
+                   seen.adopted + seen.adopted_unkillable);
 #else
-          else say("leftovers group %ld adopted %ld\n", seen.group - seen.self, -1);
+          else say("leftovers group %ld adopted %ld\n", seen.group + seen.unkillable - seen.self, -1);
 #endif
         } else if (!strcmp(line, "release")) {
           released = 1;
@@ -478,6 +575,10 @@ int main(int argc, char **argv) {
     // With the socket closed, the doorstop has nothing to do but custody.
     if (s < 0 && !k.active) break;
   }
+  // Reap only a command that has ended: one still running here (custody gave
+  // up on it, or could not see) must not hold the doorstop in a wait for
+  // ever. It is left to its new parent, and the doorstop says so by 125.
+  if (c_live(c) != 0) return 125;
   int st;
   while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
   return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);

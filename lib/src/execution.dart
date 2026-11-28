@@ -933,7 +933,7 @@ class Executor {
         killWait,
         proc.stderr.transform(utf8.decoder).join(),
       );
-      unawaited(proc.stdout.drain<void>());
+      _letGoOf(proc, stderrTaken: true);
       return _NotLaunched(
         _CouldNotStart('the doorstop did not start: ${said ?? ''}'.trim()),
       );
@@ -949,8 +949,7 @@ class Executor {
         : await _upTo(ExecTimer.answer, killWait, link.exec.future);
     if (started == null || exec == null) {
       link.abandon();
-      unawaited(proc.stdout.drain<void>());
-      unawaited(proc.stderr.drain<void>());
+      _letGoOf(proc);
       return const _NotLaunched(
         _CouldNotStart('the doorstop did not say whether the command started'),
       );
@@ -958,8 +957,7 @@ class Executor {
     switch (exec) {
       case DoorstopExecFailed(:final errno):
         link.release();
-        unawaited(proc.stdout.drain<void>());
-        unawaited(proc.stderr.drain<void>());
+        _letGoOf(proc);
         return _NotLaunched(
           errno == _enoent
               ? _NoSuchProgram(argv.first)
@@ -967,6 +965,18 @@ class Executor {
         );
       case DoorstopExecRan():
         return _Launched(proc: proc, link: link, pid: started.pid);
+    }
+  }
+
+  /// Lets go of a doorstop whose command will not run here: its stdin closed
+  /// (else this process holds the pipe's write end until the [Process] is
+  /// collected) and what it prints drained; its stderr only when nothing has
+  /// read it yet ([stderrTaken]), since a stream is listened to once.
+  static void _letGoOf(Process proc, {bool stderrTaken = false}) {
+    unawaited(proc.stdin.close().then<void>((_) {}, onError: (Object _) {}));
+    unawaited(proc.stdout.drain<void>().catchError((Object _) {}));
+    if (!stderrTaken) {
+      unawaited(proc.stderr.drain<void>().catchError((Object _) {}));
     }
   }
 

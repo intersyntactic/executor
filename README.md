@@ -36,8 +36,11 @@ scan of running processes observes, it does not prove. `ExecResult.cleanup`
 and `ExecResult.leftovers` say so in their types.
 
 The doorstop ships inside this package as bytes
-(`lib/src/doorstop_bytes.g.dart`, built by `tool/build_doorstop.dart` with
-zig from the C source; CI rebuilds it and fails on any difference). On first
+(`lib/src/doorstop_bytes.g.dart`, built by `tool/build_doorstop.dart` from
+the C source; CI rebuilds it and fails on any difference). Build it with zig
+0.15.2 as ziglang.org ships it (`ZIG=<path>` if it is not first on PATH): a
+packaged zig of the same version, such as Homebrew's, builds with the system's
+clang and makes different bytes, and the tool refuses it. On first
 use it is written to the user's cache folder and run once with `--probe`.
 Where there is no build for the platform, or it cannot be run there (a cache
 mounted `noexec`), commands are refused with the reason, as on Windows, rather

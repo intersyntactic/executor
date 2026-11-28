@@ -61,11 +61,27 @@ void main() {
     expect(r.forModel, startsWith('ended by signal 1'));
   });
 
+  test('a file with no #! line is not run through a shell', () async {
+    // execvp would hand it to /bin/sh (ENOEXEC), and argv is never a shell.
+    final script = File('${tree.path}/noshebang')
+      ..writeAsStringSync('echo ran > ${tree.path}/marker\n');
+    expect(Process.runSync('chmod', ['+x', script.path]).exitCode, 0);
+    final start = await executor().start([
+      './noshebang',
+    ], taps: ExecTaps.none).result;
+    expect(start, isA<ExecNotStarted>());
+    expect(
+      (start as ExecNotStarted).why,
+      contains('not a program this system can run'),
+    );
+    expect(File('${tree.path}/marker').existsSync(), isFalse);
+  });
+
   test('a kill says what it left: nothing, as far as could be seen', () async {
     final running = executor().start([
       '/bin/sh',
       '-c',
-      'sleep 300 & sleep 300 & echo up; wait',
+      'sleep 30 & sleep 30 & echo up; wait',
     ], taps: ExecTaps.none);
     await running.stdout.transform(const LineSplitter()).first;
     unawaited(running.stderr.drain<void>());
@@ -112,13 +128,15 @@ void main() {
         }
       }
 
+      // No kill in teardown: once its doorstop has let go, the pid can be
+      // another process's. Each command sleeps 30s at most, so one a failed
+      // test leaves behind ends by itself.
       final pid = int.parse(await line('pid '));
-      addTearDown(() => Process.killPid(pid, ProcessSignal.sigkill));
       return (host, pid, line);
     }
 
     test('killed outright (SIGKILL)', () async {
-      final (host, pid, _) = await hostOf(['sleep', '300']);
+      final (host, pid, _) = await hostOf(['sleep', '30']);
       expect(_alive(pid), isTrue);
       host.kill(ProcessSignal.sigkill);
       await host.exitCode;
@@ -129,7 +147,8 @@ void main() {
     test("Ctrl-C to the host's whole group", () async {
       // The signal reaches the doorstop's group too, were it in the host's:
       // it is not, so it lives to see the host go and kills the command.
-      final (host, pid, _) = await hostOf(['sleep', '300']);
+      final (host, pid, _) = await hostOf(['sleep', '30']);
+      // The host is this test's live child, and its group's leader.
       Process.killPid(-host.pid, ProcessSignal.sigint);
       await host.exitCode;
       await _untilDead(pid);
@@ -143,12 +162,11 @@ void main() {
         'perl',
         '-MPOSIX',
         '-e',
-        r'$| = 1; if (my $p = fork) { print "daemon $p\n"; sleep 300; exit } '
+        r'$| = 1; if (my $p = fork) { print "daemon $p\n"; sleep 30; exit } '
             r'POSIX::setsid(); open STDOUT, ">/dev/null"; '
-            r'exec "sleep", "300"',
+            r'exec "sleep", "30"',
       ]);
       final daemon = int.parse(await line('daemon '));
-      addTearDown(() => Process.killPid(daemon, ProcessSignal.sigkill));
       expect(_alive(daemon), isTrue);
       host.kill(ProcessSignal.sigkill);
       await host.exitCode;
@@ -170,6 +188,14 @@ void main() {
         Abi.current(),
       );
       expect(c, isA<NoProcessGroup>());
+    });
+
+    test('a cached doorstop that lost its x bit is written afresh', () async {
+      final cache = Directory('${tree.path}/cache');
+      final first = await installDoorstopIn(cache, Abi.current()) as Doorstop;
+      expect(Process.runSync('chmod', ['-x', first.path]).exitCode, 0);
+      final again = await installDoorstopIn(cache, Abi.current());
+      expect(again, isA<Doorstop>());
     });
 
     test('an install runs, and a second reuses the file', () async {

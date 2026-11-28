@@ -63,8 +63,9 @@ void main() {
     passDrains(said.future);
     final r = await runReportingLines(
       executor(),
-      // The background sleep inherits stdout/stderr and outlives the shell.
-      ['sh', '-c', 'sleep 30 & echo launched'],
+      // The background sleep inherits stdout/stderr and outlives the shell,
+      // then ends by itself: nothing here signals an id the run let go of.
+      ['sh', '-c', 'sleep 2 & echo launched'],
       taps: ExecTaps(
         onProcess: (pid, argv, e) {
           leader = pid;
@@ -77,9 +78,9 @@ void main() {
     expect(r.exitCode, 0);
     // The result is back, the leftover is still there: not ended yet.
     expect(log, [false]);
-    // Its group is the command's: killing it lets go of the pipes.
-    Process.killPid(-leader!, ProcessSignal.sigkill);
+    // When it ends, it lets go of the pipes.
     await ended.future;
+    expect(leader, isNotNull);
     expect(log, [false, true]);
   });
 
@@ -105,32 +106,29 @@ void main() {
   group('ExecResult.leftovers, seen while the ids are held', () {
     // Runs [script] and returns what its result says it left running.
     // [said] completes at the first line of output.
+    // Each leftover sleeps a few seconds and ends by itself: nothing here
+    // signals an id after the run has let go of it.
     Future<Leftovers?> left(String script, {Completer<void>? said}) async {
-      int? leader;
       final r = await runReportingLines(
         executor(),
         ['/bin/sh', '-c', script],
-        taps: ExecTaps(onProcess: (pid, _, _) => leader ??= pid),
         onLine: (_) {
           if (said != null && !said.isCompleted) said.complete();
         },
       );
-      // Do not leave a leftover behind. By group id, after the run has let
-      // go of it: a test's cleanup, not something the library does.
-      addTearDown(() => Process.killPid(-leader!, ProcessSignal.sigkill));
       return r.leftovers;
     }
 
     test('a background process that redirected its output is seen', () async {
       // It let go of the pipes (so the pipes alone say "ended"), yet it runs.
-      final l = await left('sleep 30 >/dev/null 2>&1 & echo launched');
+      final l = await left('sleep 3 >/dev/null 2>&1 & echo launched');
       expect(l?.inGroup, 1);
     });
 
     test('a background process still holding the pipes is seen', () async {
       final said = Completer<void>();
       passDrains(said.future);
-      final l = await left('sleep 30 & echo launched', said: said);
+      final l = await left('sleep 3 & echo launched', said: said);
       expect(l?.inGroup, 1);
     });
 

@@ -4,9 +4,13 @@
 //   dart run tool/build_doorstop.dart           write the file
 //   dart run tool/build_doorstop.dart --check   exit 1 if it would change
 //
-// zig cross-compiles all four from any host. Each build writes a file named
-// `doorstop`: the macOS linker's ad-hoc signature names the output file, so
-// the same name is what makes two builds the same bytes.
+// zig cross-compiles all four from any host, the same bytes from each, but
+// only zig as ziglang.org ships it, with its own LLVM: a packaged zig (such as
+// Homebrew's) reports the same version and builds with the system's clang,
+// which makes different bytes. $ZIG names the zig to use (default `zig`).
+// Each build writes a file named `doorstop`: the macOS linker's ad-hoc
+// signature names the output file, so the same name is what makes two builds
+// the same bytes.
 import 'dart:convert';
 import 'dart:io';
 
@@ -15,6 +19,9 @@ import 'package:crypto/crypto.dart';
 /// The zig release the committed bytes were built with. A different zig can
 /// build different bytes, so --check refuses any other.
 const zigVersion = '0.15.2';
+
+/// What the official build's clang says of itself; a packaged zig's does not.
+const officialClang = 'ziglang/zig-bootstrap';
 
 /// Each platform, as a zig target and as the name of its `Abi` constant.
 const targets = [
@@ -29,9 +36,18 @@ const output = 'lib/src/doorstop_bytes.g.dart';
 
 Future<void> main(List<String> args) async {
   final check = args.contains('--check');
-  final version = (await _run('zig', ['version'])).trim();
+  final zig = Platform.environment['ZIG'] ?? 'zig';
+  final version = (await _run(zig, ['version'])).trim();
   if (version != zigVersion) {
     stderr.writeln('zig $version found; the bytes are built with $zigVersion');
+    exit(2);
+  }
+  final clang = (await _run(zig, ['cc', '--version'])).split('\n').first;
+  if (!clang.contains(officialClang)) {
+    stderr.writeln(
+      '$zig builds with "$clang", not the LLVM zig ships with, so its bytes '
+      'differ: use the zig $zigVersion download from ziglang.org (ZIG=<path>)',
+    );
     exit(2);
   }
   final out = StringBuffer()
@@ -48,11 +64,19 @@ Future<void> main(List<String> args) async {
       'const doorstopBuilds = <Abi, ({String sha256, String base64})>{',
     );
   final scratch = await Directory.systemTemp.createTemp('doorstop_build_');
+  // zig's own caches, fresh for this build: the shared one is keyed by zig's
+  // version, so a packaged zig of the same version leaves libc objects there
+  // that the official one then links in (measured: its clang's name turned
+  // up in the official build's bytes).
+  final caches = {
+    'ZIG_GLOBAL_CACHE_DIR': '${scratch.path}/zig-global',
+    'ZIG_LOCAL_CACHE_DIR': '${scratch.path}/zig-local',
+  };
   try {
     for (final t in targets) {
       final dir = await Directory('${scratch.path}/${t.zig}').create();
       final exe = '${dir.path}/doorstop';
-      await _run('zig', [
+      await _run(zig, [
         'cc',
         '-target',
         t.zig,
@@ -64,7 +88,7 @@ Future<void> main(List<String> args) async {
         '-o',
         exe,
         source,
-      ]);
+      ], environment: caches);
       final bytes = await File(exe).readAsBytes();
       out
         ..writeln('  Abi.${t.abi}: (')
@@ -95,8 +119,12 @@ Future<void> main(List<String> args) async {
   stdout.writeln('wrote $output');
 }
 
-Future<String> _run(String exe, List<String> args) async {
-  final r = await Process.run(exe, args);
+Future<String> _run(
+  String exe,
+  List<String> args, {
+  Map<String, String>? environment,
+}) async {
+  final r = await Process.run(exe, args, environment: environment);
   if (r.exitCode != 0) {
     stderr.writeln(
       '$exe ${args.join(' ')} failed (${r.exitCode}):\n'
